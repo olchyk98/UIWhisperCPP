@@ -24,7 +24,10 @@ class View(QtWidgets.QWidget):
 
   @QtCore.Slot()
   def handleSelectFileClick(self):
-    audio_paths, _ = QFileDialog.getOpenFileNames(self)
+    audio_paths, _ = QFileDialog.getOpenFileNames(
+      self, 
+      filter="Audio Files (*.wav *.mp3)"
+    )
     # TODO: In case actual transcription dies mid execution,
     # we can at least have the file transcribed partially.
     # Introduce "progressive_segments" 
