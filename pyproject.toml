@@ -1,0 +1,11 @@
+[project]
+name = "uiwhispercpp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydub>=0.25.1",
+    "pyside6>=6.10.2",
+    "pywhispercpp>=1.4.1",
+]
