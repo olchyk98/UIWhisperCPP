@@ -1,0 +1,4 @@
+[00:00:00.000 --> 00:00:03.240]: Generating a UI interface, please wait.
+[00:00:03.240 --> 00:00:04.600]: Pause.
+[00:00:04.600 --> 00:00:08.640]: The ring 0 is prompted to be executed, x i 1.
+[00:00:08.640 --> 00:00:14.720]: Please say confirm to confirm sudo execution of the ring 0 operation.
