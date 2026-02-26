@@ -28,13 +28,16 @@ def _get_model () -> Model:
 def transcribe (
   file_path: str,
   /,
-  on_chunk: Callable[[Segment], None]
+  on_chunk: Callable[[Segment], None],
+  on_progress: Callable[[int], None],
 ) -> list[Segment]:
   model = _get_model()
   return model.transcribe(
     # NOTE: Whisper requires audio in 16kHZ, 
     # therefore we have to downsize it first
     media=resample_audio(file_path, 16000),
-    new_segment_callback=on_chunk
+    new_segment_callback=on_chunk,
+    extract_probability=False,
+    progress_callback=on_progress
   )
 
