@@ -4,6 +4,7 @@
 import threading
 from pywhispercpp.model import Segment
 from uiwhispercpp.gui.logger_widget import LoggerWidget
+from uiwhispercpp.gui.settings_selectors_widget import SettingsSelectorsWidget
 from uiwhispercpp.gui.transcription_progress import TranscriptionProgress
 from uiwhispercpp.gui.upload_file_button import UploadFileButton
 from uiwhispercpp.transcript import project_and_save_transcript_for_file, project_segment
@@ -15,6 +16,7 @@ DS_STORE = '.DS_Store'
 
 class View(QtWidgets.QWidget):
   button: UploadFileButton
+  settings_selectors: SettingsSelectorsWidget
   root_layout: QtWidgets.QVBoxLayout
   logger: LoggerWidget
   progress: TranscriptionProgress
@@ -25,8 +27,10 @@ class View(QtWidgets.QWidget):
     self.button = UploadFileButton(callback=self.handle_files_selected)
     self.logger = LoggerWidget()
     self.progress = TranscriptionProgress()
+    self.settings_selectors = SettingsSelectorsWidget()
 
     self.root_layout = QtWidgets.QVBoxLayout(self)
+    self.root_layout.addWidget(self.settings_selectors)
     self.root_layout.addLayout(self.button)
     self.root_layout.addLayout(self.progress)
     self.root_layout.addWidget(self.logger)
@@ -65,11 +69,14 @@ class View(QtWidgets.QWidget):
           all_segments = transcribe(
             audio_path, 
             on_chunk=handle_chunk,
-            on_progress=handle_progress
+            on_progress=handle_progress,
+            language=self.settings_selectors.get_language(),
+            model_key=self.settings_selectors.get_model(),
           )
           transcript_path = project_and_save_transcript_for_file(audio_path, all_segments)
           self.logger.log(f"DONE, WRITTEN TO '{transcript_path}'")
         except Exception as e:
+          print(e)
           self.logger.log(f"THE FILE '{audio_path}' FAILED TO PROCESS")
           self.logger.log(str(e))
         finally:
