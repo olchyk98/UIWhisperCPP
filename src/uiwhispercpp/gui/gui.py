@@ -58,6 +58,7 @@ class View(QtWidgets.QWidget):
           def handle_chunk(segment: Segment) -> None:
             self.logger.log(project_segment(segment))
             live_segments.append(segment)
+            project_and_save_transcript_for_file(audio_path, live_segments)
           def handle_progress(progress: int):
             self.progress.set_indeterminate(False)
             self.progress.set_value(progress)
