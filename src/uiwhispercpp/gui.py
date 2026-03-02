@@ -3,6 +3,8 @@
 # program would crash if we'd try to update any UI elements
 # from any sub thread (which we use for transcription).
 
+import os
+from typing import Callable
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QVBoxLayout, QPushButton, QFileDialog
 import threading
 
@@ -11,7 +13,7 @@ from uiwhispercpp.transcript import project_and_save_transcript_for_file, projec
 import sys
 from uiwhispercpp.transcribe import transcribe
 from PySide6 import QtCore, QtWidgets
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QDir, Signal
 
 DS_STORE = '.DS_Store'
 
@@ -123,46 +125,79 @@ class TranscriptionProgress(TranscriptionProgressSignalBase, QHBoxLayout):
 class UploadFileButtonSignalBase(object):
   disabled_value_set = Signal(bool)
 
-class UploadFileButton (UploadFileButtonSignalBase, QPushButton):
-  def __init__(self, *args, **kwargs):
-    super().__init__(*args, **kwargs)
+class UploadFileButton (UploadFileButtonSignalBase, QHBoxLayout):
+  select_files_button: QPushButton
+  select_folder_button: QPushButton
+  callback: Callable[[list[str]], None]
+
+  def __init__(
+    self,
+    callback: Callable[[list[str]], None]
+  ):
+    super().__init__()
     self.disabled_value_set.connect(self._set_disabled)
+    self.callback = callback
+
+    self.select_files_button = QPushButton("Select file(s)")
+    self.select_files_button.clicked.connect(self.handle_select_files_click)
+    self.addWidget(self.select_files_button)
+
+    self.select_folder_button = QPushButton("Select folder")
+    self.select_folder_button.clicked.connect(self.handle_select_folder_click)
+    self.addWidget(self.select_folder_button)
+
+
+  @QtCore.Slot()
+  def handle_select_files_click (self) -> None:
+    audio_paths, _ = QFileDialog.getOpenFileNames(
+      self.parentWidget(), 
+      filter="Audio Files (*.wav *.mp3)",
+    )
+    self.callback(audio_paths)
+
+  @QtCore.Slot()
+  def handle_select_folder_click (self) -> None:
+    dir_path = QFileDialog.getExistingDirectory(
+      self.parentWidget(),
+    )
+    qdir = QDir(dir_path)
+    relative_audio_paths = qdir.entryList(["*.wav", "*.mp3"])
+    audio_paths = [ os.path.join(dir_path, p) for p in relative_audio_paths ]
+    self.callback(audio_paths)
 
   def set_disabled(self, value: bool) -> None:
     self.disabled_value_set.emit(value)
 
   def _set_disabled (self, value: bool) -> None:
-    self.setDisabled(value)
+    self.select_files_button.setDisabled(value)
+    self.select_folder_button.setDisabled(value)
 
 class View(QtWidgets.QWidget):
   button: UploadFileButton
-  layout: QVBoxLayout
+  root_layout: QVBoxLayout
   logger: LoggerWidget
   progress: TranscriptionProgress
 
   def __init__ (self):
     super().__init__()
 
-    self.button = UploadFileButton("Select file/folder")
-    self.button.clicked.connect(self.handleSelectFileClick)
+    self.button = UploadFileButton(callback=self.handle_files_selected)
     self.logger = LoggerWidget()
     self.progress = TranscriptionProgress()
 
-    self.layout = QtWidgets.QVBoxLayout(self)
-    self.layout.addWidget(self.button)
-    self.layout.addLayout(self.progress)
-    self.layout.addWidget(self.logger)
+    self.root_layout = QtWidgets.QVBoxLayout(self)
+    self.root_layout.addLayout(self.button)
+    self.root_layout.addLayout(self.progress)
+    self.root_layout.addWidget(self.logger)
 
     self.progress.set_visibility(False)
     self.logger.log("Please, select a file or a folder to start transcribing.")
 
-  @QtCore.Slot()
-  def handleSelectFileClick(self):
-    audio_paths, _ = QFileDialog.getOpenFileNames(
-      self, 
-      filter="Audio Files (*.wav *.mp3)"
-    )
+  @QtCore.Slot(list)
+  def handle_files_selected(self, audio_paths: list[str]) -> None:
     self.logger.log(f"Selected {len(audio_paths)} files!")
+    for audio_path in audio_paths:
+      self.logger.log(f"Queued: '{audio_path}'")
     def _thread () -> None:
       self.button.set_disabled(True)
       index = 0
