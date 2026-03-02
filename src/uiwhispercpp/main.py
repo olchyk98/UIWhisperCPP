@@ -1,4 +1,4 @@
-from uiwhispercpp.gui import run_program
+from uiwhispercpp.gui.gui import run_program
 
 # TODO: Split into gui (x)
 # TODO: Block non wav/mp3 files (x)
