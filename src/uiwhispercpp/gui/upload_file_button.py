@@ -33,7 +33,7 @@ class UploadFileButton (UploadFileButtonSignalBase, QHBoxLayout):
   def handle_select_files_click (self) -> None:
     audio_paths, _ = QFileDialog.getOpenFileNames(
       self.parentWidget(), 
-      filter="Audio Files (*.wav *.mp3)",
+      filter="Audio Files (*.wav *.mp3 *.m4a)",
     )
     self.callback(audio_paths)
 
@@ -43,7 +43,7 @@ class UploadFileButton (UploadFileButtonSignalBase, QHBoxLayout):
       self.parentWidget(),
     )
     qdir = QDir(dir_path)
-    relative_audio_paths = qdir.entryList(["*.wav", "*.mp3"])
+    relative_audio_paths = qdir.entryList(["*.wav", "*.mp3", "*.m4a"])
     audio_paths = [ os.path.join(dir_path, p) for p in relative_audio_paths ]
     self.callback(audio_paths)
 
