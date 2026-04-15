@@ -37,7 +37,13 @@ def _get_model (key: str) -> Model:
       return _cached_model
     del _cached_model
     _cached_model_key = None
-  _cached_model = Model(key)
+  # params_sampling_strategy=1 -> BEAM_SEARCH (beam_size=5).
+  # Default is greedy, which gets stuck in repetition loops on large-v3
+  # (classic symptom: uniform 1-second segments repeating the same phrase
+  # at end-of-audio). Beam search explores multiple hypotheses per step
+  # and escapes those local minima. Costs ~2-3x inference time but it's
+  # the single biggest quality lever whisper.cpp exposes.
+  _cached_model = Model(key, params_sampling_strategy=1)
   _cached_model_key = key
   return _cached_model
 
@@ -51,12 +57,31 @@ def transcribe (
 ) -> list[Segment]:
   model = _get_model(model_key)
   return model.transcribe(
-    # NOTE: Whisper requires audio in 16kHZ, 
+    # NOTE: Whisper requires audio in 16kHZ,
     # therefore we have to downsize it first
     media=resample_audio(file_path, 16000),
     new_segment_callback=on_chunk,
     extract_probability=False,
     progress_callback=on_progress,
-    language=language
+    language=language,
+    # Anti-repetition-loop settings. large-v3 is prone to locking into
+    # a repeat ("Crystal glass and velvet haze..." on loop) at
+    # end-of-audio, on music, or over long silences.
+    #
+    # Note: no_context is NOT listed here because its default is
+    # already True in whisper.cpp's default params. Setting it here
+    # would be a no-op. It only governs handoff between 30s chunks
+    # anyway; the loop we care about is WITHIN a chunk, which is
+    # why we switched to beam search in _get_model.
+    #
+    # Threshold tweaks below make whisper.cpp more aggressive about
+    # detecting a bad decode and retrying at a higher temperature:
+    #   - entropy_thold: raise so high-confidence loops still trigger fallback
+    #   - logprob_thold: tighten "this decode looks bad" bar
+    #   - no_speech_thold: lower so silent/instrumental segments get
+    #     skipped instead of hallucinated into
+    entropy_thold=2.8,
+    logprob_thold=-0.5,
+    no_speech_thold=0.3,
   )
 
