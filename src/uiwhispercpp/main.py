@@ -6,7 +6,6 @@ from uiwhispercpp.gui.gui import run_program
 # TODO: Provide support for folders (x)
 # TODO: Allow to select model size (x)
 # TODO: Allow to specify language (x)
-# TODO: py2mac/py2exe
 # TODO: Prompt user before closing the app (when transcribing)
 # TODO: Prompt before starting transcription (cancel file selection to be the easiest)
 # TODO: Bug: Weird scrolling to the bottom when scrolled up
@@ -14,3 +13,7 @@ from uiwhispercpp.gui.gui import run_program
 
 def main() -> None:
     run_program()
+
+
+if __name__ == "__main__":
+    main()

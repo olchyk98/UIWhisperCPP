@@ -2,7 +2,12 @@ from collections.abc import Callable
 from pywhispercpp.model import Model, Segment
 import time
 import os
+import imageio_ffmpeg
 from pydub import AudioSegment
+
+# Point pydub at the ffmpeg binary that ships with imageio-ffmpeg,
+# so the packaged .app doesn't depend on a system-installed ffmpeg.
+AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
 def resample_audio (p: str, frame_rate: int) -> str:
   base = "/tmp/uiwhispercpp"
