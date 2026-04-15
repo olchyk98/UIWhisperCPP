@@ -37,7 +37,13 @@ def _get_model (key: str) -> Model:
       return _cached_model
     del _cached_model
     _cached_model_key = None
-  _cached_model = Model(key)
+  # params_sampling_strategy=1 -> BEAM_SEARCH (beam_size=5).
+  # Default is greedy, which gets stuck in repetition loops on large-v3
+  # (classic symptom: uniform 1-second segments repeating the same phrase
+  # at end-of-audio). Beam search explores multiple hypotheses per step
+  # and escapes those local minima. Costs ~2-3x inference time but it's
+  # the single biggest quality lever whisper.cpp exposes.
+  _cached_model = Model(key, params_sampling_strategy=1)
   _cached_model_key = key
   return _cached_model
 
@@ -51,12 +57,18 @@ def transcribe (
 ) -> list[Segment]:
   model = _get_model(model_key)
   return model.transcribe(
-    # NOTE: Whisper requires audio in 16kHZ, 
+    # NOTE: Whisper requires audio in 16kHZ,
     # therefore we have to downsize it first
     media=resample_audio(file_path, 16000),
     new_segment_callback=on_chunk,
     extract_probability=False,
     progress_callback=on_progress,
-    language=language
+    language=language,
+    # Anti-hallucination settings from whisper.cpp recommendations:
+    # https://github.com/ggerganov/whisper.cpp/issues/897#issuecomment-1521due
+    no_context=False,      # allow context (C API defaults to True / off)
+    n_max_text_ctx=64,     # but cap it at 64 tokens so loops can't self-reinforce
+    temperature_inc=0.1,   # finer fallback steps (default 0.2) per original whisper
+    entropy_thold=2.8,     # catch low-entropy repetitive decodes earlier
   )
 
