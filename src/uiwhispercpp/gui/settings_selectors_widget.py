@@ -7,6 +7,7 @@ class Option:
   value: str
 
 languages = [
+  Option("Auto-detect", ""),
   Option("English", "en"),
   Option("Ukrainian", "uk"),
   Option("Swedish", "sv"),
