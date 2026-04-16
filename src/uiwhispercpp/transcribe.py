@@ -1,13 +1,9 @@
 from collections.abc import Callable
 from pywhispercpp.model import Model, Segment
+import subprocess
 import time
 import os
 import imageio_ffmpeg
-from pydub import AudioSegment
-
-# Point pydub at the ffmpeg binary that ships with imageio-ffmpeg,
-# so the packaged .app doesn't depend on a system-installed ffmpeg.
-AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
 def resample_audio (p: str, frame_rate: int) -> str:
   base = "/tmp/uiwhispercpp"
@@ -15,9 +11,13 @@ def resample_audio (p: str, frame_rate: int) -> str:
     os.makedirs(base)
   unix = time.time() * 1e6
   file_path = f"{base}/{unix}__resampled.wav"
-  audio: AudioSegment = AudioSegment.from_file(p)
-  with_16khz = audio.set_frame_rate(frame_rate)
-  with_16khz.export(file_path, format="wav")
+  subprocess.run(
+    [imageio_ffmpeg.get_ffmpeg_exe(),
+     "-i", p, "-ar", str(frame_rate), "-ac", "1", file_path, "-y"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+  )
   return file_path
 
 _cached_model: Model | None = None
