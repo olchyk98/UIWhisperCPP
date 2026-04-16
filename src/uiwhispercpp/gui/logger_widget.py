@@ -19,12 +19,12 @@ class LoggerWidget(LoggerWidgetSignalBase, QtWidgets.QTextBrowser):
 
   @Slot(str)
   def _log(self, message: str) -> None:
-    # Scrolling to the bottom, if not 
-    # viewing some older logs right now
     scrollbar_y = self.verticalScrollBar()
-    at_the_bottom = scrollbar_y.maximum() - 30 < scrollbar_y.value()
-    # Updating the content
+    at_the_bottom = scrollbar_y.value() >= scrollbar_y.maximum() - 30
+    old_value = scrollbar_y.value()
     self.lines.append(message)
     self.setPlainText('\n\n'.join(self.lines))
     if at_the_bottom:
-      scrollbar_y.setValue(999999)
+      scrollbar_y.setValue(scrollbar_y.maximum())
+    else:
+      scrollbar_y.setValue(old_value)
