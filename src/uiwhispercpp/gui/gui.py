@@ -2,14 +2,13 @@
 # This is because signals allow us to call GUI redraw from non GUI thread (which is main thread in this case). Signals forward requests from sub threads to main thread to repaint something. Without them the program would crash if we'd try to update any UI elements from any sub thread (which we use for transcription).
 
 import threading
-from pywhispercpp.model import Segment
 from uiwhispercpp.gui.logger_widget import LoggerWidget
 from uiwhispercpp.gui.settings_selectors_widget import SettingsSelectorsWidget
 from uiwhispercpp.gui.transcription_progress import TranscriptionProgress
 from uiwhispercpp.gui.upload_file_button import UploadFileButton
+from uiwhispercpp.models import ModelManager, Segment
 from uiwhispercpp.transcript import project_and_save_transcript_for_file, project_segment
 import sys
-from uiwhispercpp.transcribe import transcribe
 from PySide6 import QtCore, QtWidgets
 
 DS_STORE = '.DS_Store'
@@ -20,14 +19,16 @@ class View(QtWidgets.QWidget):
   root_layout: QtWidgets.QVBoxLayout
   logger: LoggerWidget
   progress: TranscriptionProgress
+  model_manager: ModelManager
 
   def __init__ (self):
     super().__init__()
 
+    self.model_manager = ModelManager()
     self.button = UploadFileButton(callback=self.handle_files_selected)
     self.logger = LoggerWidget()
     self.progress = TranscriptionProgress()
-    self.settings_selectors = SettingsSelectorsWidget()
+    self.settings_selectors = SettingsSelectorsWidget(self.model_manager.available_models())
 
     self.root_layout = QtWidgets.QVBoxLayout(self)
     self.root_layout.addWidget(self.settings_selectors)
@@ -66,9 +67,9 @@ class View(QtWidgets.QWidget):
           def handle_progress(progress: int):
             self.progress.set_indeterminate(False)
             self.progress.set_value(progress)
-          all_segments = transcribe(
-            audio_path, 
-            on_chunk=handle_chunk,
+          all_segments = self.model_manager.transcribe(
+            audio_path,
+            on_segment=handle_chunk,
             on_progress=handle_progress,
             language=self.settings_selectors.get_language(),
             model_key=self.settings_selectors.get_model(),

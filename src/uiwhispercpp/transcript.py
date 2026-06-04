@@ -1,4 +1,4 @@
-from pywhispercpp.model import Segment
+from uiwhispercpp.models import Segment
 import os
 
 def format_timestamp (timestamp: float) -> str:
@@ -13,10 +13,8 @@ def format_timestamp (timestamp: float) -> str:
   return f"{hours:02}:{minutes:02}:{seconds_int:02}.{milliseconds:03}"
 
 def project_segment(segment: Segment) -> str:
-    # t0 and t1 are stored as CENTISECONDS. 
-    # Needs to be divided by 100 to get seconds.
-    start = format_timestamp(segment.t0 / 100)
-    end = format_timestamp(segment.t1 / 100)
+    start = format_timestamp(segment.start)
+    end = format_timestamp(segment.end)
     text = segment.text
 
     return f"[{start} --> {end}]: {text}"

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QWidget
+from uiwhispercpp.models import ModelOption
 
 @dataclass
 class Option:
@@ -14,27 +15,22 @@ languages = [
   Option("Russian", "ru"),
 ]
 
-models = [
-  Option("XLarge - Even more accurate, slowest (3GB)", "large-v3"),
-  Option("Large - More accurate, slower (1.5GB)", "medium"),
-  Option("Base - Balance between accuracy and speed (500MB)", "small"),
-  Option("Small - Terrible, but fast (140MB)", "base"),
-]
-
 
 class SettingsSelectorsWidget(QWidget):
   root_layout: QHBoxLayout
   language_select: QComboBox
   model_select: QComboBox
+  models: list[ModelOption]
 
-  def __init__(self):
+  def __init__(self, models: list[ModelOption]):
     super().__init__()
+    self.models = models
 
     self.language_select = QComboBox()
     self.language_select.addItems([ f.label for f in languages ])
 
     self.model_select = QComboBox()
-    self.model_select.addItems([ f.label for f in models ])
+    self.model_select.addItems([ m.label for m in models ])
 
     self.root_layout = QHBoxLayout(self)
     self.root_layout.addWidget(self.language_select)
@@ -42,8 +38,7 @@ class SettingsSelectorsWidget(QWidget):
 
   def get_model (self) -> str:
     index = self.model_select.currentIndex()
-    option = models[index]
-    return option.value
+    return self.models[index].key
 
   def get_language (self) -> str:
     index = self.language_select.currentIndex()

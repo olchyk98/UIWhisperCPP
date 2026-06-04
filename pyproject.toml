@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "imageio-ffmpeg>=0.6.0",
+  "parakeet-mlx>=0.5.1",
   "pyside6>=6.10.2",
   "pywhispercpp>=1.4.1",
 ]
