@@ -20,7 +20,7 @@ class ModelManager:
   """
 
   def __init__(self) -> None:
-    self._backends: list[Model] = [Whisper(), Parakeet()]
+    self._backends: list[Model] = [Parakeet(), Whisper()]
     self._backend_by_key = {
       option.key: backend
       for backend in self._backends
