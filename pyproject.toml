@@ -6,9 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "imageio-ffmpeg>=0.6.0",
+  "librosa>=0.11.0",
+  "numpy>=2.4.2",
+  "onnxruntime>=1.27.0",
   "parakeet-mlx>=0.5.1",
   "pyside6>=6.10.2",
   "pywhispercpp>=1.4.1",
+  "scipy>=1.17.1",
+  "soundfile>=0.13.1",
+  "soxr>=1.1.0",
 ]
 
 [project.scripts]

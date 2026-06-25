@@ -30,6 +30,26 @@ def resample_to_wav(audio_path: str, frame_rate: int) -> str:
   return out_path
 
 
+def decode_to_mono_wav(audio_path: str) -> str:
+  """Decode `audio_path` to a mono WAV at its native sample rate (no resampling).
+
+  ffmpeg's default sample-rate converter degrades the signal enough to wreck
+  speaker-embedding quality (it collapsed diarization to one speaker). Callers
+  that care about spectral fidelity decode at the native rate here and do the
+  rate conversion themselves with a high-quality resampler (soxr).
+  """
+  os.makedirs(_TMP_DIR, exist_ok=True)
+  unix = time.time() * 1e6
+  out_path = f"{_TMP_DIR}/{unix}__mono.wav"
+  subprocess.run(
+    [imageio_ffmpeg.get_ffmpeg_exe(), "-i", audio_path, "-ac", "1", out_path, "-y"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+  )
+  return out_path
+
+
 def ensure_ffmpeg_on_path() -> None:
   """Make the bundled ffmpeg discoverable as a bare `ffmpeg` command.
 

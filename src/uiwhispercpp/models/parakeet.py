@@ -6,6 +6,7 @@ from uiwhispercpp.models.base import (
   OnProgress,
   OnSegment,
   Segment,
+  Word,
 )
 
 # Long audio is transcribed in overlapping windows. Chunking also gives us the
@@ -65,9 +66,16 @@ class Parakeet(Model):
     )
 
     # parakeet returns the whole result at once; replay it through the same
-    # streaming callback the rest of the app expects.
+    # streaming callback the rest of the app expects. We also carry the per-word
+    # timing (reconstructed from the model's sub-word tokens) so speaker
+    # diarization can attribute speakers word-by-word.
     segments = [
-      Segment(start=sentence.start, end=sentence.end, text=sentence.text.strip())
+      Segment(
+        start=sentence.start,
+        end=sentence.end,
+        text=sentence.text.strip(),
+        words=_words_from_sentence(sentence),
+      )
       for sentence in result.sentences
     ]
     for segment in segments:
@@ -92,3 +100,30 @@ class Parakeet(Model):
     self._model = from_pretrained(model_key)
     self._loaded_key = model_key
     return self._model
+
+
+def _words_from_sentence(sentence: object) -> tuple[Word, ...]:
+  """Group a sentence's sub-word tokens into whole words with timing.
+
+  parakeet-mlx emits sub-word tokens whose `.text` carries a leading space at
+  the start of each new word (e.g. " hello", "ing"). We start a new word at any
+  token whose text begins with a space, so punctuation that hangs off the end of
+  a word ("you?", "do.") stays attached, and each word spans the time from its
+  first token's start to its last token's end.
+  """
+  words: list[Word] = []
+  current: list[object] = []
+  for token in sentence.tokens:
+    if current and token.text.startswith(" "):
+      words.append(_word_from_tokens(current))
+      current = [token]
+    else:
+      current.append(token)
+  if current:
+    words.append(_word_from_tokens(current))
+  return tuple(word for word in words if word.text)
+
+
+def _word_from_tokens(tokens: list[object]) -> Word:
+  text = "".join(token.text for token in tokens).strip()
+  return Word(start=tokens[0].start, end=tokens[-1].end, text=text)

@@ -1,4 +1,4 @@
-from uiwhispercpp.models import Segment
+from uiwhispercpp.models import Segment, Turn
 import os
 
 def format_timestamp (timestamp: float) -> str:
@@ -28,12 +28,29 @@ def project_transcript (segments: list[Segment]) -> str:
 
   return '\n'.join(lines)
 
-def project_and_save_transcript_for_file (
-  audio_file_path: str,
-  segments: list[Segment]
-) -> str:
-  transcript = project_transcript(segments)
+def project_turn(turn: Turn) -> str:
+    start = format_timestamp(turn.start)
+    end = format_timestamp(turn.end)
+
+    return f"[{start} --> {end}] [Speaker {turn.speaker}]: {turn.text}"
+
+def project_diarized_transcript (turns: list[Turn]) -> str:
+  return '\n'.join(project_turn(turn) for turn in turns)
+
+def _save_transcript_for_file (audio_file_path: str, transcript: str) -> str:
   transcript_path = os.path.splitext(audio_file_path)[0] + '.txt'
   with open(transcript_path, "w") as f:
     f.write(transcript)
   return transcript_path
+
+def project_and_save_transcript_for_file (
+  audio_file_path: str,
+  segments: list[Segment]
+) -> str:
+  return _save_transcript_for_file(audio_file_path, project_transcript(segments))
+
+def project_and_save_diarized_transcript_for_file (
+  audio_file_path: str,
+  turns: list[Turn]
+) -> str:
+  return _save_transcript_for_file(audio_file_path, project_diarized_transcript(turns))
