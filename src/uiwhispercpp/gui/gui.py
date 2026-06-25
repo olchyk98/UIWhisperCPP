@@ -6,8 +6,13 @@ from uiwhispercpp.gui.logger_widget import LoggerWidget
 from uiwhispercpp.gui.settings_selectors_widget import SettingsSelectorsWidget
 from uiwhispercpp.gui.transcription_progress import TranscriptionProgress
 from uiwhispercpp.gui.upload_file_button import UploadFileButton
-from uiwhispercpp.models import ModelManager, Segment
-from uiwhispercpp.transcript import project_and_save_transcript_for_file, project_segment
+from uiwhispercpp.models import Diarizer, ModelManager, Segment, label_segments
+from uiwhispercpp.transcript import (
+  project_and_save_diarized_transcript_for_file,
+  project_and_save_transcript_for_file,
+  project_segment,
+  project_turn,
+)
 import sys
 from PySide6 import QtCore, QtWidgets
 
@@ -20,11 +25,13 @@ class View(QtWidgets.QWidget):
   logger: LoggerWidget
   progress: TranscriptionProgress
   model_manager: ModelManager
+  diarizer: Diarizer
 
   def __init__ (self):
     super().__init__()
 
     self.model_manager = ModelManager()
+    self.diarizer = Diarizer()
     self.button = UploadFileButton(callback=self.handle_files_selected)
     self.logger = LoggerWidget()
     self.progress = TranscriptionProgress()
@@ -74,7 +81,10 @@ class View(QtWidgets.QWidget):
             language=self.settings_selectors.get_language(),
             model_key=self.settings_selectors.get_model(),
           )
-          transcript_path = project_and_save_transcript_for_file(audio_path, all_segments)
+          if self.settings_selectors.get_diarize():
+            transcript_path = self._diarize_and_save(audio_path, all_segments)
+          else:
+            transcript_path = project_and_save_transcript_for_file(audio_path, all_segments)
           self.logger.log(f"DONE, WRITTEN TO '{transcript_path}'")
         except Exception as e:
           print(e)
@@ -84,6 +94,30 @@ class View(QtWidgets.QWidget):
           index += 1
       self.button.set_disabled(False)
     threading.Thread(target=_thread).start()
+
+  def _diarize_and_save(self, audio_path: str, segments: list[Segment]) -> str:
+    """Run the diarization pass, merge it onto `segments`, and save the result.
+
+    Diarization is a whole-file pass that only runs once transcription has
+    finished, so it cannot stream; we show indeterminate progress while the
+    models load, then a percentage as the segmentation works through the audio.
+    """
+    self.logger.log("------ SEPARATING SPEAKERS ------")
+    self.progress.set_indeterminate(True)
+    def handle_progress(progress: int) -> None:
+      self.progress.set_indeterminate(False)
+      self.progress.set_value(progress)
+    speaker_segments = self.diarizer.diarize(
+      audio_path,
+      num_speakers=self.settings_selectors.get_num_speakers(),
+      on_progress=handle_progress,
+      on_log=self.logger.log,
+    )
+    labeled = label_segments(segments, speaker_segments)
+    transcript_path = project_and_save_diarized_transcript_for_file(audio_path, labeled)
+    for line in labeled:
+      self.logger.log(project_turn(line))
+    return transcript_path
 
 def run_program () -> None:
   app = QtWidgets.QApplication()

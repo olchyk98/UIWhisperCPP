@@ -12,6 +12,12 @@ from uiwhispercpp.gui.gui import run_program
 # TODO: Bug: When selecting folder, pressing cancel starts transcribing
 
 def main() -> None:
+    # Speaker diarization runs in a spawned child process. In a frozen
+    # (PyInstaller) build, the child re-launches this same executable, so
+    # freeze_support() must run first to intercept it — otherwise the child
+    # would start a second GUI instead of doing its work.
+    import multiprocessing
+    multiprocessing.freeze_support()
     run_program()
 
 

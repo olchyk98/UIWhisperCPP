@@ -14,11 +14,27 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class Segment:
-  """One transcribed span of audio. Times are in seconds."""
+class Word:
+  """One word with its own timing, in seconds. `text` is the bare word."""
   start: float
   end: float
   text: str
+
+
+@dataclass(frozen=True)
+class Segment:
+  """One transcribed span of audio. Times are in seconds.
+
+  `words` carries per-word timing when the backend can produce it (Parakeet
+  does; whisper.cpp through pywhispercpp does not). Speaker diarization uses it
+  to attribute a speaker to each word, so a single sentence that straddles a
+  speaker change can be split correctly. When it is empty, diarization falls
+  back to attributing the whole segment to one speaker.
+  """
+  start: float
+  end: float
+  text: str
+  words: tuple[Word, ...] = ()
 
 
 @dataclass(frozen=True)
