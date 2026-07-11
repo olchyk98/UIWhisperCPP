@@ -13,6 +13,11 @@ from uiwhispercpp.models.base import (
 # progress callbacks parakeet-mlx only emits when it splits a file.
 CHUNK_DURATION = 120.0
 OVERLAP_DURATION = 15.0
+# TDT beam search explores several hypotheses per step instead of greedily
+# committing to one; on our test audio it fixes real word errors ("taxes" ->
+# "taxis") for ~4x slower decoding, which is still ~15x realtime on Apple
+# Silicon.
+BEAM_SIZE = 5
 
 
 class Parakeet(Model):
@@ -21,7 +26,9 @@ class Parakeet(Model):
   parakeet-mlx and mlx are imported lazily, so the app starts fast and only
   pulls in the heavy MLX runtime once a Parakeet model is actually used. The v3
   model is multilingual and detects the language itself, so the `language` hint
-  is ignored.
+  is ignored. (The English-only v2, `mlx-community/parakeet-tdt-0.6b-v2`, scores
+  ~0.3 WER points better on English — judged too small to be worth a second
+  dropdown entry.)
   """
 
   _OPTIONS = [
@@ -56,6 +63,8 @@ class Parakeet(Model):
       if total > 0:
         on_progress(int(position / total * 100))
 
+    from parakeet_mlx.parakeet import Beam, DecodingConfig
+
     # parakeet-mlx loads and resamples the audio itself, so we hand it the
     # original file untouched.
     result = model.transcribe(
@@ -63,6 +72,7 @@ class Parakeet(Model):
       chunk_duration=CHUNK_DURATION,
       overlap_duration=OVERLAP_DURATION,
       chunk_callback=report_progress,
+      decoding_config=DecodingConfig(decoding=Beam(beam_size=BEAM_SIZE)),
     )
 
     # parakeet returns the whole result at once; replay it through the same
