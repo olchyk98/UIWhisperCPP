@@ -94,10 +94,11 @@ class Diarizer:
   ) -> list[SpeakerSegment]:
     """Return speaker-labelled spans for `audio_path`, sorted by start time.
 
-    `num_speakers` pins the cluster count when known (the single biggest quality
-    lever); leave it at `AUTO_SPEAKERS` to auto-detect. Models are downloaded
-    here (so downloads are logged) on first use; diarization runs in a child
-    process.
+    `num_speakers` caps the cluster count when known (the single biggest
+    quality lever); clusters that are clearly the same voice are still merged,
+    so a lone narrator pinned to 2 speakers comes back as one speaker. Leave it
+    at `AUTO_SPEAKERS` to auto-detect. Models are downloaded here (so downloads
+    are logged) on first use; diarization runs in a child process.
     """
     log = on_log or (lambda _message: None)
     segmentation_model, embedding_model = _ensure_models(log)

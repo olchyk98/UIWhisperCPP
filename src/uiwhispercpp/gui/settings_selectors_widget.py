@@ -62,7 +62,8 @@ class SettingsSelectorsWidget(QWidget):
     self.speakers_spin.setValue(_DEFAULT_SPEAKERS_SPIN)
     self.speakers_spin.setToolTip(
       "How many people are in the recording. Setting the exact count gives the "
-      "cleanest separation; 'Auto' (0) guesses but is less reliable."
+      "cleanest separation; 'Auto' (0) guesses but is less reliable. The count "
+      "acts as a maximum: voices that sound identical are not split apart."
     )
     self.speakers_spin.setEnabled(False)
 
