@@ -1409,7 +1409,7 @@ requires-dist = [
     { name = "librosa", specifier = ">=0.11.0" },
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "onnxruntime", specifier = ">=1.27.0" },
-    { name = "parakeet-mlx", specifier = ">=0.5.1" },
+    { name = "parakeet-mlx", specifier = ">=0.5.1,<0.6" },
     { name = "pyside6", specifier = ">=6.10.2" },
     { name = "pywhispercpp", specifier = ">=1.4.1" },
     { name = "scipy", specifier = ">=1.17.1" },

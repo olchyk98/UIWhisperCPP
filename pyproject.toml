@@ -9,7 +9,9 @@ dependencies = [
   "librosa>=0.11.0",
   "numpy>=2.4.2",
   "onnxruntime>=1.27.0",
-  "parakeet-mlx>=0.5.1",
+  # <0.6: parakeet.py patches get_logmel internals (power-spectrum fix), so
+  # minor-version drift is reviewed before upgrading.
+  "parakeet-mlx>=0.5.1,<0.6",
   "pyside6>=6.10.2",
   "pywhispercpp>=1.4.1",
   "scipy>=1.17.1",
