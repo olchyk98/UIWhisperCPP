@@ -43,15 +43,22 @@ class ModelOption:
 
   `key` is the stable identifier the manager uses to route a request back to the
   backend that owns it; `label` is the human-readable description.
+  `unavailable_reason` is set when this Mac cannot run the model at all (e.g.
+  MLX on an Intel Mac); the UI shows it greyed out with that reason.
   """
   key: str
   label: str
+  unavailable_reason: str | None = None
+  # Compact name shown in the closed model menu ("Parakeet v3").
+  short_label: str = ""
 
 
 # Called once per segment, as transcription produces it.
 OnSegment = Callable[[Segment], None]
 # Called with a completion percentage in the range 0..100.
 OnProgress = Callable[[int], None]
+# Called with short human-readable status updates ("Installing Parakeet...").
+OnStatus = Callable[[str], None]
 
 
 class Model(ABC):
@@ -75,6 +82,7 @@ class Model(ABC):
     language: str,
     on_segment: OnSegment,
     on_progress: OnProgress,
+    on_status: OnStatus | None = None,
   ) -> list[Segment]:
     """Transcribe `audio_path` using the variant identified by `model_key`.
 

@@ -1,13 +1,11 @@
 """Whisper backend, powered by whisper.cpp through pywhispercpp."""
-from pywhispercpp.model import Model as WhisperCppModel
-from pywhispercpp.model import Segment as WhisperCppSegment
-
 from uiwhispercpp.models.audio import resample_to_wav
 from uiwhispercpp.models.base import (
   Model,
   ModelOption,
   OnProgress,
   OnSegment,
+  OnStatus,
   Segment,
 )
 
@@ -23,14 +21,19 @@ class Whisper(Model):
   """
 
   _OPTIONS = [
-    ModelOption("large-v3", "XLarge - Even more accurate, slowest (3GB)"),
-    ModelOption("medium", "Large - More accurate, slower (1.5GB)"),
-    ModelOption("small", "Base - Balance between accuracy and speed (500MB)"),
-    ModelOption("base", "Small - Terrible, but fast (140MB)"),
+    ModelOption("large-v3", "XLarge - Even more accurate, slowest (3GB)",
+                short_label="Whisper XLarge"),
+    ModelOption("medium", "Large - More accurate, slower (1.5GB)",
+                short_label="Whisper Large"),
+    ModelOption("small", "Base - Balance between accuracy and speed (500MB)",
+                short_label="Whisper Base"),
+    ModelOption("base", "Small - Terrible, but fast (140MB)",
+                short_label="Whisper Small"),
   ]
 
   def __init__(self) -> None:
-    self._model: WhisperCppModel | None = None
+    # pywhispercpp is imported lazily in _load so the app window opens fast.
+    self._model: object | None = None
     self._loaded_key: str | None = None
 
   @property
@@ -45,8 +48,13 @@ class Whisper(Model):
     language: str,
     on_segment: OnSegment,
     on_progress: OnProgress,
+    on_status: OnStatus | None = None,
   ) -> list[Segment]:
+    if on_status is not None:
+      on_status("Loading the Whisper model...")
     model = self._load(model_key)
+    if on_status is not None:
+      on_status("Transcribing...")
     raw_segments = model.transcribe(
       media=resample_to_wav(audio_path, SAMPLE_RATE),
       new_segment_callback=lambda segment: on_segment(_to_segment(segment)),
@@ -68,10 +76,11 @@ class Whisper(Model):
     self._model = None
     self._loaded_key = None
 
-  def _load(self, model_key: str) -> WhisperCppModel:
+  def _load(self, model_key: str) -> object:
     if self._model is not None and self._loaded_key == model_key:
       return self._model
     self.unload()
+    from pywhispercpp.model import Model as WhisperCppModel
     # params_sampling_strategy=1 -> BEAM_SEARCH (beam_size=5). The default is
     # greedy, which gets stuck in repetition loops on large-v3 (classic symptom:
     # uniform 1-second segments repeating the same phrase at end-of-audio). Beam
@@ -83,6 +92,6 @@ class Whisper(Model):
     return self._model
 
 
-def _to_segment(segment: WhisperCppSegment) -> Segment:
+def _to_segment(segment: object) -> Segment:
   # whisper.cpp reports t0/t1 in centiseconds.
   return Segment(start=segment.t0 / 100, end=segment.t1 / 100, text=segment.text)

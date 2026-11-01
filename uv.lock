@@ -1383,7 +1383,7 @@ wheels = [
 
 [[package]]
 name = "uiwhispercpp"
-version = "0.1.0"
+version = "1.5"
 source = { editable = "." }
 dependencies = [
     { name = "imageio-ffmpeg" },

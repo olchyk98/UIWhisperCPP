@@ -15,19 +15,21 @@ Everything runs on your machine. Your audio never leaves your computer.
 
 ## What it does
 
-- **Transcribe .wav, .mp3 and .m4a files** - select one or many, it'll work through them
+- **Transcribe almost any audio or video file** - WAV, MP3, M4A, WMA, FLAC, OGG/Opus, AAC, AIFF, MP4, MOV, MKV and more. Drop files or whole folders onto the window and it works through them one by one
 - **Choose your model** - Whisper sizes (base to large-v3) or Parakeet v3, a fast multilingual model for Apple Silicon
 - **Separate speakers (optional)** - tick "Separate speakers" and each line is tagged `[Speaker 0]`, `[Speaker 1]`, … so a conversation reads as a back-and-forth. If you know how many people are talking, set the count for the cleanest result (defaults to 2; leave it on "Auto" if unsure). Runs as a local [pyannote](https://github.com/pyannote/pyannote-audio) ONNX pipeline - no HuggingFace account or API key
-- **Real-time progress** - watch the transcription happen with a progress bar and live log output
-- **Timestamped output** - saves transcripts as `.txt` files with `[HH:MM:SS.mmm --> HH:MM:SS.mmm]` timestamps (SRT-style), prefixed with `[Speaker N]` when speaker separation is on
+- **Live progress** - each file shows its progress in the list, and its transcript fills in on the right as it's produced
+- **Your output format** - in Settings (`⌘,`) choose start-and-end, start-only or no timestamps, milliseconds or seconds, speaker labels on or off, and plain `.txt` or `.srt` subtitles, with a live preview. Default: `[HH:MM:SS.mmm --> HH:MM:SS.mmm]: text`, prefixed with `[Speaker N]` when speaker separation is on
+- **One-click updates** - Settings > Updates checks GitHub releases (this repo by default, changeable), downloads the new version with progress and restarts into it
 - **Runs completely offline** - powered by Whisper or Parakeet, no internet required after the initial model download
 
 ## Getting started
 
 ### Requirements
 
-- Python 3.11+
-- An Apple Silicon Mac (only required for the Parakeet model; Whisper runs anywhere)
+- macOS 15 (Sequoia) or newer for the packaged app - older Macs get a clear message instead of a silent crash
+- Python 3.11+ (when running from source)
+- An Apple Silicon Mac for the Parakeet model (Whisper runs anywhere). From source, Parakeet installs itself on first use if it's missing
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
 > FFmpeg is bundled via [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), so no separate install is needed.
@@ -58,11 +60,11 @@ On first launch, the app will download a Whisper model. This takes a bit dependi
 
 Pretty straightforward pipeline:
 
-1. You pick audio files through the file dialog
+1. You drop audio files (or pick them through the file dialog)
 2. Audio gets resampled to 16 kHz (what the models expect)
 3. The selected backend processes the audio locally - whisper.cpp for Whisper, MLX for Parakeet
 4. Segments come back via callbacks - you see them in the log as they arrive
-5. Final transcript gets saved as a `.txt` next to the original file
+5. Final transcript gets saved next to the original file, in the format chosen in Settings
 
 When **Separate speakers** is enabled, a second pass runs after transcription: a local pyannote speaker-diarization pipeline (pure [ONNX Runtime](https://onnxruntime.ai/), no PyTorch) works out who spoke when, and each transcript line is tagged with the matching speaker. It uses the transcriber's word-level timestamps, so a long turn that mixes two voices gets split at the right word rather than dumped under one label. This pass runs in a separate process to keep the UI responsive while it works.
 

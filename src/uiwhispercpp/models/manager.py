@@ -4,8 +4,10 @@ from uiwhispercpp.models.base import (
   ModelOption,
   OnProgress,
   OnSegment,
+  OnStatus,
   Segment,
 )
+from uiwhispercpp.models.audio import check_audio
 from uiwhispercpp.models.parakeet import Parakeet
 from uiwhispercpp.models.whisper import Whisper
 
@@ -29,8 +31,14 @@ class ModelManager:
     self._active_backend: Model | None = None
 
   def available_models(self) -> list[ModelOption]:
-    """Every model the user can pick, in display order."""
+    """Every model, in display order (unsupported ones carry a reason)."""
     return [option for backend in self._backends for option in backend.options]
+
+  def default_model_key(self) -> str:
+    """The first model this Mac can actually run."""
+    models = self.available_models()
+    usable = [m for m in models if not m.unavailable_reason]
+    return (usable or models)[0].key
 
   def transcribe(
     self,
@@ -40,11 +48,16 @@ class ModelManager:
     language: str,
     on_segment: OnSegment,
     on_progress: OnProgress,
+    on_status: OnStatus | None = None,
   ) -> list[Segment]:
     """Transcribe `audio_path` with the model identified by `model_key`."""
     backend = self._backend_by_key.get(model_key)
     if backend is None:
       raise ValueError(f"Unknown model '{model_key}'.")
+    option = next(o for o in backend.options if o.key == model_key)
+    if option.unavailable_reason:
+      raise RuntimeError(option.unavailable_reason)
+    check_audio(audio_path)
 
     # Keep a single model in memory: release the previous backend's weights
     # before a different backend loads its own.
@@ -58,4 +71,5 @@ class ModelManager:
       language=language,
       on_segment=on_segment,
       on_progress=on_progress,
+      on_status=on_status,
     )

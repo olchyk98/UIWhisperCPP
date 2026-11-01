@@ -15,18 +15,57 @@ import imageio_ffmpeg
 _TMP_DIR = "/tmp/uiwhispercpp"
 
 
+class AudioReadError(RuntimeError):
+  """A file ffmpeg can't decode, with a short user-facing message."""
+
+
+def _ffmpeg_failure(audio_path: str, stderr: str) -> AudioReadError:
+  name = os.path.basename(audio_path)
+  text = stderr.lower()
+  if "does not contain any stream" in text or "matches no streams" in text:
+    return AudioReadError(f"'{name}' has no audio track to transcribe.")
+  lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+  reason = lines[-1] if lines else "unknown error"
+  # ffmpeg prefixes the reason with the input path; keep only the reason.
+  if ": " in reason and audio_path in reason:
+    reason = reason.split(": ", 1)[1] if reason.startswith(audio_path) else reason
+  return AudioReadError(f"'{name}' couldn't be read as audio ({reason}).")
+
+
+def check_audio(audio_path: str) -> None:
+  """Fail fast, with a readable message, when `audio_path` has no decodable audio.
+
+  Decodes a fraction of a second of the first audio stream; cheap, and it keeps
+  raw ffmpeg dumps out of the UI.
+  """
+  if not os.path.isfile(audio_path):
+    raise AudioReadError(f"'{os.path.basename(audio_path)}' no longer exists.")
+  result = subprocess.run(
+    [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-v", "error",
+     "-i", audio_path, "-map", "0:a:0", "-t", "0.5", "-f", "null", "-"],
+    capture_output=True,
+    text=True,
+  )
+  if result.returncode != 0:
+    raise _ffmpeg_failure(audio_path, result.stderr)
+
+
+def _run_ffmpeg(audio_path: str, command: list[str]) -> None:
+  result = subprocess.run(command, capture_output=True, text=True)
+  if result.returncode != 0:
+    raise _ffmpeg_failure(audio_path, result.stderr)
+
+
 def resample_to_wav(audio_path: str, frame_rate: int) -> str:
   """Resample `audio_path` to a mono WAV at `frame_rate` and return its path."""
   os.makedirs(_TMP_DIR, exist_ok=True)
   unix = time.time() * 1e6
   out_path = f"{_TMP_DIR}/{unix}__resampled.wav"
-  subprocess.run(
-    [imageio_ffmpeg.get_ffmpeg_exe(),
-     "-i", audio_path, "-ar", str(frame_rate), "-ac", "1", out_path, "-y"],
-    check=True,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-  )
+  _run_ffmpeg(audio_path, [
+    # -vn: video files are accepted too; only their audio track is decoded.
+    imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-v", "error",
+    "-i", audio_path, "-vn", "-ar", str(frame_rate), "-ac", "1", out_path, "-y",
+  ])
   return out_path
 
 
@@ -41,12 +80,10 @@ def decode_to_mono_wav(audio_path: str) -> str:
   os.makedirs(_TMP_DIR, exist_ok=True)
   unix = time.time() * 1e6
   out_path = f"{_TMP_DIR}/{unix}__mono.wav"
-  subprocess.run(
-    [imageio_ffmpeg.get_ffmpeg_exe(), "-i", audio_path, "-ac", "1", out_path, "-y"],
-    check=True,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-  )
+  _run_ffmpeg(audio_path, [
+    imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-v", "error",
+    "-i", audio_path, "-vn", "-ac", "1", out_path, "-y",
+  ])
   return out_path
 
 
