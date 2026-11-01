@@ -12,13 +12,22 @@ from PySide6.QtWidgets import (
   QStyleOptionViewItem,
 )
 
-from uiwhispercpp.gui.theme import ACCENT, DANGER, SUCCESS, secondary_text, selection_fill
+from uiwhispercpp.gui.theme import (
+  ACCENT,
+  DANGER,
+  SUCCESS,
+  WARNING,
+  secondary_text,
+  selection_fill,
+)
 from uiwhispercpp.transcript import Line, OutputOptions
 
 QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
+STOPPED = "stopped"
+FINISHED_STATES = (DONE, FAILED, STOPPED)
 
 INDETERMINATE = -1
 
@@ -38,6 +47,14 @@ class Job:
   # Options the saved file was written with (None until saved).
   saved_options: OutputOptions | None = None
   error: str | None = None
+  # A non-fatal note on a finished file, e.g. "saved without speaker labels".
+  warning: str | None = None
+  # Where this file's transcript goes, decided when it starts (name clashes
+  # are resolved with the user up front) and reused on Try Again.
+  target_path: str | None = None
+  # "Parakeet v3 · Auto language · 2 speakers": the settings it ran with.
+  summary: str = ""
+  stop_token: object | None = None
 
   @property
   def name(self) -> str:
@@ -87,23 +104,34 @@ class _JobDelegate(QStyledItemDelegate):
       DONE: QColor(SUCCESS),
       FAILED: QColor(DANGER),
     }.get(job.state, secondary_text(palette))
+    if job.state == DONE and job.warning:
+      status_color = QColor(WARNING)
     painter.setPen(status_color)
     status_rect = QRect(
       inner.left(), inner.top() + inner.height() // 2, inner.width(), inner.height() // 2
     )
     status = job.status
-    if job.state == RUNNING and job.progress != INDETERMINATE:
-      status = f"{status}  {job.progress}%"
+    metrics = painter.fontMetrics()
+    percent_width = 0
+    if job.state == RUNNING and job.progress != INDETERMINATE and "%" not in status:
+      percent = f"{job.progress}%"
+      percent_width = metrics.horizontalAdvance(percent) + 8
+      painter.drawText(
+        status_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, percent
+      )
+    text_rect = status_rect.adjusted(0, 0, -percent_width, 0)
+    if job.state == DONE and not job.warning:
+      status = f"\u2713 {status}"
     painter.drawText(
-      status_rect,
+      text_rect,
       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-      painter.fontMetrics().elidedText(status, Qt.TextElideMode.ElideRight, status_rect.width()),
+      metrics.elidedText(status, Qt.TextElideMode.ElideRight, text_rect.width()),
     )
 
     if job.state == RUNNING:
       track = QRect(rect.left() + 10, rect.bottom() - 4, rect.width() - 20, 3)
       track_color = secondary_text(palette)
-      track_color.setAlphaF(0.18)
+      track_color.setAlphaF(0.12)
       painter.setPen(Qt.PenStyle.NoPen)
       painter.setBrush(track_color)
       painter.drawRoundedRect(track, 1.5, 1.5)
@@ -193,18 +221,9 @@ class FileQueue(QListWidget):
     if self.count():
       return
     painter = QPainter(self.viewport())
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    rect = self.viewport().rect().adjusted(12, 12, -12, -12)
-    pen_color = secondary_text(self.palette())
-    pen_color.setAlphaF(0.28)
-    pen = painter.pen()
-    pen.setColor(pen_color)
-    pen.setStyle(Qt.PenStyle.DashLine)
-    painter.setPen(pen)
-    painter.drawRoundedRect(rect, 10, 10)
     painter.setPen(secondary_text(self.palette()))
     painter.drawText(
-      rect,
+      self.viewport().rect().adjusted(12, 12, -12, -12),
       Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
-      "Drop audio or video files here\n\nWAV, MP3, M4A, WMA, FLAC, OGG, AAC, MP4 and more",
+      "No files yet",
     )

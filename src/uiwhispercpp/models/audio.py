@@ -12,24 +12,62 @@ import time
 
 import imageio_ffmpeg
 
+from uiwhispercpp import app_log
+from uiwhispercpp.models.base import UserFacingError
+
+_log = app_log.get("audio")
+
 _TMP_DIR = "/tmp/uiwhispercpp"
 
 
-class AudioReadError(RuntimeError):
+class AudioReadError(UserFacingError):
   """A file ffmpeg can't decode, with a short user-facing message."""
+
+
+# Opening a file normally takes well under a second; a long stall means a
+# cloud placeholder that isn't downloaded or an unreachable network share.
+_CHECK_TIMEOUT = 120
+# Full decodes of very long recordings can take a while, but never this long.
+_DECODE_TIMEOUT = 60 * 60
 
 
 def _ffmpeg_failure(audio_path: str, stderr: str) -> AudioReadError:
   name = os.path.basename(audio_path)
   text = stderr.lower()
+  _log.warning("ffmpeg could not read %s: %s", audio_path, stderr.strip()[-500:])
   if "does not contain any stream" in text or "matches no streams" in text:
-    return AudioReadError(f"'{name}' has no audio track to transcribe.")
-  lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
-  reason = lines[-1] if lines else "unknown error"
-  # ffmpeg prefixes the reason with the input path; keep only the reason.
-  if ": " in reason and audio_path in reason:
-    reason = reason.split(": ", 1)[1] if reason.startswith(audio_path) else reason
-  return AudioReadError(f"'{name}' couldn't be read as audio ({reason}).")
+    return AudioReadError(f"\u201c{name}\u201d has no sound to transcribe.")
+  if "permission denied" in text or "operation not permitted" in text:
+    return AudioReadError(
+      f"UIWhisperCPP isn't allowed to open \u201c{name}\u201d. Allow access in System "
+      "Settings > Privacy & Security > Files and Folders, then try again."
+    )
+  return AudioReadError(
+    f"\u201c{name}\u201d can't be opened. It may be damaged or in an unusual format. "
+    "If it won't play in QuickTime either, it can't be transcribed."
+  )
+
+
+def _run(audio_path: str, command: list[str], timeout: int) -> subprocess.CompletedProcess:
+  try:
+    return subprocess.run(command, capture_output=True, timeout=timeout)
+  except subprocess.TimeoutExpired as error:
+    raise AudioReadError(
+      f"\u201c{os.path.basename(audio_path)}\u201d took too long to open. If it's stored "
+      "in iCloud or on a network drive, make sure it's fully downloaded, then try again."
+    ) from error
+
+
+def sweep_temp_files(max_age_hours: float = 6) -> None:
+  """Delete decoded audio left behind by crashes or forced quits."""
+  import glob
+  cutoff = time.time() - max_age_hours * 3600
+  for path in glob.glob(f"{_TMP_DIR}/*.wav"):
+    try:
+      if os.path.getmtime(path) < cutoff:
+        os.remove(path)
+    except OSError:
+      pass
 
 
 def check_audio(audio_path: str) -> None:
@@ -38,22 +76,26 @@ def check_audio(audio_path: str) -> None:
   Decodes a fraction of a second of the first audio stream; cheap, and it keeps
   raw ffmpeg dumps out of the UI.
   """
+  name = os.path.basename(audio_path)
   if not os.path.isfile(audio_path):
-    raise AudioReadError(f"'{os.path.basename(audio_path)}' no longer exists.")
-  result = subprocess.run(
-    [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-v", "error",
-     "-i", audio_path, "-map", "0:a:0", "-t", "0.5", "-f", "null", "-"],
-    capture_output=True,
-    text=True,
-  )
+    raise AudioReadError(
+      f"\u201c{name}\u201d was moved or deleted. Add it again from its new location."
+    )
+  result = _run(audio_path, [
+    imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-v", "error",
+    "-i", audio_path, "-map", "0:a:0", "-t", "1", "-ac", "1", "-ar", "8000",
+    "-f", "s16le", "-",
+  ], _CHECK_TIMEOUT)
   if result.returncode != 0:
-    raise _ffmpeg_failure(audio_path, result.stderr)
+    raise _ffmpeg_failure(audio_path, result.stderr.decode("utf-8", "replace"))
+  if not result.stdout:
+    raise AudioReadError(f"\u201c{name}\u201d is empty: it contains no sound.")
 
 
 def _run_ffmpeg(audio_path: str, command: list[str]) -> None:
-  result = subprocess.run(command, capture_output=True, text=True)
+  result = _run(audio_path, command, _DECODE_TIMEOUT)
   if result.returncode != 0:
-    raise _ffmpeg_failure(audio_path, result.stderr)
+    raise _ffmpeg_failure(audio_path, result.stderr.decode("utf-8", "replace"))
 
 
 def resample_to_wav(audio_path: str, frame_rate: int) -> str:

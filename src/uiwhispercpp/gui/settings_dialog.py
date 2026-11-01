@@ -8,7 +8,6 @@ import threading
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import (
-  QApplication,
   QCheckBox,
   QComboBox,
   QDialog,
@@ -24,7 +23,8 @@ from PySide6.QtWidgets import (
   QWidget,
 )
 
-from uiwhispercpp import updater
+from uiwhispercpp import app_log, updater
+from uiwhispercpp.gui.debug_log import show_debug_log
 from uiwhispercpp.gui.theme import DANGER
 from uiwhispercpp.settings import Settings
 from uiwhispercpp.transcript import (
@@ -41,18 +41,20 @@ from uiwhispercpp.transcript import (
 )
 from uiwhispercpp.version import DEFAULT_UPDATE_REPO
 
+_log = app_log.get("updater")
+
 _TIMESTAMP_CHOICES = [
   ("Start and end", TIMESTAMPS_RANGE),
   ("Start only", TIMESTAMPS_START),
-  ("None", TIMESTAMPS_OFF),
+  ("No timestamps", TIMESTAMPS_OFF),
 ]
 _PRECISION_CHOICES = [
-  ("Milliseconds  (00:01:05.250)", PRECISION_MS),
-  ("Seconds  (00:01:05)", PRECISION_SECONDS),
+  ("With milliseconds (00:01:05.250)", PRECISION_MS),
+  ("To the second (00:01:05)", PRECISION_SECONDS),
 ]
 _FILE_CHOICES = [
   ("Plain text (.txt)", FILE_TXT),
-  ("Subtitles (.srt)", FILE_SRT),
+  ("Subtitles for video players (.srt)", FILE_SRT),
 ]
 
 
@@ -74,7 +76,7 @@ class _OutputTab(QWidget):
 
     self.timestamps = _combo(_TIMESTAMP_CHOICES, options.timestamps)
     self.precision = _combo(_PRECISION_CHOICES, options.precision)
-    self.speaker_labels = QCheckBox("Label speakers  (when Separate speakers is on)")
+    self.speaker_labels = QCheckBox("Label speakers (when Separate speakers is on)")
     self.speaker_labels.setChecked(options.speaker_labels)
     self.file_type = _combo(_FILE_CHOICES, options.file_type)
     self.srt_note = QLabel("Subtitles always include start and end times.")
@@ -90,9 +92,9 @@ class _OutputTab(QWidget):
     form = QFormLayout()
     form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
     form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
-    form.addRow("Save as:", self.file_type)
+    form.addRow("File type:", self.file_type)
     form.addRow("Timestamps:", self.timestamps)
-    form.addRow("Precision:", self.precision)
+    form.addRow("Time detail:", self.precision)
     form.addRow("", self.srt_note)
     form.addRow("", self.speaker_labels)
 
@@ -104,6 +106,9 @@ class _OutputTab(QWidget):
     layout.addSpacing(8)
     layout.addWidget(preview_title)
     layout.addWidget(self.preview)
+    applies = QLabel("Changes apply to files transcribed from now on.")
+    applies.setObjectName("Hint")
+    layout.addWidget(applies)
     layout.addStretch()
 
     for combo in (self.timestamps, self.precision, self.file_type):
@@ -168,7 +173,12 @@ class _UpdateSignals(QObject):
 
 
 class _UpdatesTab(QWidget):
-  def __init__(self, settings: Settings, is_busy: Callable[[], bool]) -> None:
+  def __init__(
+    self,
+    settings: Settings,
+    is_busy: Callable[[], bool],
+    request_install: Callable[[str, str], str],
+  ) -> None:
     super().__init__()
     self._settings = settings
     self._is_busy = is_busy
@@ -180,13 +190,14 @@ class _UpdatesTab(QWidget):
     self._signals.downloaded.connect(self._on_downloaded)
     self._signals.failed.connect(self._on_failed)
 
-    version = QLabel(f"UIWhisperCPP {updater.current_version()}")
+    self._request_install = request_install
+    version = QLabel(f"You have version {updater.current_version()}")
     version.setObjectName("FileTitle")
 
     self.repo = QLineEdit(settings.update_repo())
     self.repo.setPlaceholderText(DEFAULT_UPDATE_REPO)
     self.repo.editingFinished.connect(self._save_repo)
-    reset = QPushButton("Reset")
+    reset = QPushButton("Use Default")
     reset.setObjectName("Flat")
     reset.clicked.connect(self._reset_repo)
     repo_row = QHBoxLayout()
@@ -194,10 +205,17 @@ class _UpdatesTab(QWidget):
     repo_row.addWidget(reset)
     repo_hint = QLabel("GitHub repository to download releases from (owner/repo).")
     repo_hint.setObjectName("FileStatus")
+    self.repo_warning = QLabel(
+      "Not the official source: only use a repository you trust, since updates "
+      "replace the app."
+    )
+    self.repo_warning.setWordWrap(True)
+    self.repo_warning.setStyleSheet(f"color: {DANGER};")
+    self.repo.textChanged.connect(self._update_repo_warning)
 
-    self.check_button = QPushButton("Check for updates")
+    self.check_button = QPushButton("Check for Updates")
     self.check_button.clicked.connect(self._check)
-    self.update_button = QPushButton("Update and restart")
+    self.update_button = QPushButton("Update and Restart")
     self.update_button.setDefault(True)
     self.update_button.clicked.connect(self._download)
     self.update_button.hide()
@@ -214,17 +232,44 @@ class _UpdatesTab(QWidget):
     self.progress.setFixedHeight(6)
     self.progress.hide()
 
+    # Where updates come from is a developer concern: tucked under Advanced.
+    advanced = QWidget()
+    advanced_layout = QVBoxLayout(advanced)
+    advanced_layout.setContentsMargins(0, 0, 0, 0)
+    advanced_layout.addWidget(QLabel("Update source"))
+    advanced_layout.addLayout(repo_row)
+    advanced_layout.addWidget(repo_hint)
+    advanced_layout.addWidget(self.repo_warning)
+    advanced_toggle = QPushButton("Advanced \u25b8")
+    advanced_toggle.setObjectName("Quiet")
+    advanced_toggle.setCheckable(True)
+
+    def toggle_advanced(shown: bool) -> None:
+      advanced.setVisible(shown)
+      advanced_toggle.setText("Advanced \u25be" if shown else "Advanced \u25b8")
+
+    advanced_toggle.toggled.connect(toggle_advanced)
+    unofficial = settings.update_repo() != DEFAULT_UPDATE_REPO
+    advanced_toggle.setChecked(unofficial)
+    advanced.setVisible(unofficial)
+
     layout = QVBoxLayout(self)
     layout.addWidget(version)
-    layout.addSpacing(10)
-    layout.addWidget(QLabel("Update source"))
-    layout.addLayout(repo_row)
-    layout.addWidget(repo_hint)
     layout.addSpacing(10)
     layout.addLayout(buttons)
     layout.addWidget(self.progress)
     layout.addWidget(self.status)
     layout.addStretch()
+    layout.addWidget(advanced_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+    layout.addWidget(advanced)
+    self._update_repo_warning()
+
+  def _update_repo_warning(self) -> None:
+    try:
+      official = updater.parse_repo(self.repo.text() or DEFAULT_UPDATE_REPO) == DEFAULT_UPDATE_REPO
+    except updater.UpdateError:
+      official = True  # invalid input gets its own message on check
+    self.repo_warning.setVisible(not official)
 
   def _save_repo(self) -> None:
     self._settings.set_update_repo(self.repo.text())
@@ -247,27 +292,32 @@ class _UpdatesTab(QWidget):
       return
     self.check_button.setEnabled(False)
     self.update_button.hide()
-    self._set_status("Checking...")
+    self._set_status("Checking…")
 
     def work() -> None:
       try:
         self._signals.checked.emit(updater.check_for_update(repo))
       except updater.UpdateError as error:
         self._signals.failed.emit(str(error))
-      except Exception as error:  # noqa: BLE001 - surface anything to the user
-        self._signals.failed.emit(f"Update check failed: {error}")
+      except Exception:  # noqa: BLE001 - surface anything to the user
+        _log.exception("Update check failed")
+        self._signals.failed.emit(
+          "Couldn't check for updates right now. Try again later. "
+          "(Details are in Help > Debug Log.)"
+        )
 
     threading.Thread(target=work, daemon=True).start()
 
   def _on_checked(self, release: "updater.Release | None") -> None:
+    _log.info("Update check: %s", release or "up to date")
     self.check_button.setEnabled(True)
     self._release = release
     if release is None:
-      self._set_status(f"You're up to date ({updater.current_version()}).")
+      self._set_status(f"You have the latest version ({updater.current_version()}).")
       return
     can_update, reason = updater.can_self_update()
     size_mb = release.asset_size / 1_000_000
-    message = f"Version {release.version} is available ({size_mb:.0f} MB)."
+    message = f"Version {release.version} is available ({size_mb:.0f} MB download)."
     if not can_update:
       self._set_status(f"{message}\n{reason}")
       return
@@ -286,7 +336,7 @@ class _UpdatesTab(QWidget):
     self.repo.setEnabled(False)
     self.progress.setRange(0, 0)
     self.progress.show()
-    self._set_status("Downloading...")
+    self._set_status("Downloading the update… Keep this window open.")
     release = self._release
 
     def work() -> None:
@@ -299,34 +349,47 @@ class _UpdatesTab(QWidget):
         self._signals.downloaded.emit(bundle)
       except updater.UpdateError as error:
         self._signals.failed.emit(str(error))
-      except Exception as error:  # noqa: BLE001
-        self._signals.failed.emit(f"Update failed: {error}")
+      except Exception:  # noqa: BLE001
+        _log.exception("Update download failed")
+        self._signals.failed.emit(
+          "The update couldn't be downloaded. Try again later. "
+          "(Details are in Help > Debug Log.)"
+        )
 
     threading.Thread(target=work, daemon=True).start()
 
   def _on_progress(self, done: int, total: int) -> None:
     if total <= 0:
-      self._set_status(f"Downloading... {done / 1_000_000:.0f} MB")
+      self._set_status(f"Downloading the update… {done / 1_000_000:.0f} MB")
       return
     percent = int(done * 100 / total)
     self.progress.setRange(0, 100)
     self.progress.setValue(percent)
     self._set_status(
-      f"Downloading... {percent}%  ({done / 1_000_000:.0f} of {total / 1_000_000:.0f} MB)"
+      f"Downloading the update… {percent}% ({done / 1_000_000:.0f} of "
+      f"{total / 1_000_000:.0f} MB). Keep this window open."
     )
 
   def _on_downloaded(self, new_bundle: str) -> None:
     target = updater.running_app_bundle()
     if target is None:
-      self._on_failed("Can't find the running app to replace.")
+      self._on_failed("The update download is incomplete or damaged. Try again.")
       return
     self.progress.setRange(0, 0)
-    self._set_status("Installing and restarting...")
-    updater.install_and_relaunch(new_bundle, target)
-    QApplication.instance().setProperty("updating", True)
-    QApplication.quit()
+    self._set_status("Installing… The app will close and reopen by itself.")
+    outcome = self._request_install(new_bundle, target)
+    if outcome == "later":
+      # Files are still being transcribed: install once they're done.
+      self.progress.hide()
+      self._set_status(
+        "The update is ready. It installs and restarts the app automatically "
+        "when the current files are finished and saved."
+      )
+    elif outcome == "failed":
+      self._on_failed("The update couldn't be installed. Try again later.")
 
   def _on_failed(self, message: str) -> None:
+    _log.warning("Update failed: %s", message)
     self.progress.hide()
     self.check_button.setEnabled(True)
     self.update_button.setEnabled(True)
@@ -344,6 +407,7 @@ class SettingsDialog(QDialog):
     settings: Settings,
     on_output_change: Callable[[OutputOptions], None],
     is_busy: Callable[[], bool],
+    request_install: Callable[[str, str], str],
   ) -> None:
     super().__init__(parent)
     self.setWindowTitle("Settings")
@@ -351,11 +415,21 @@ class SettingsDialog(QDialog):
     tabs = QTabWidget()
     tabs.setDocumentMode(True)
     self.output_tab = _OutputTab(settings, on_output_change)
-    self.updates_tab = _UpdatesTab(settings, is_busy)
+    self.updates_tab = _UpdatesTab(settings, is_busy, request_install)
     tabs.addTab(self.output_tab, "Output")
     tabs.addTab(self.updates_tab, "Updates")
+    # Deliberately quiet: a small muted link for troubleshooting.
+    debug_link = QPushButton("Debug log")
+    debug_link.setObjectName("Quiet")
+    debug_link.setCursor(Qt.CursorShape.PointingHandCursor)
+    debug_link.setToolTip("Raw program output, for troubleshooting (⌥⌘L)")
+    debug_link.clicked.connect(show_debug_log)
+    footer = QHBoxLayout()
+    footer.addStretch()
+    footer.addWidget(debug_link)
     layout = QVBoxLayout(self)
     layout.addWidget(tabs)
+    layout.addLayout(footer)
     self.tabs = tabs
 
   def show_tab(self, index: int) -> None:

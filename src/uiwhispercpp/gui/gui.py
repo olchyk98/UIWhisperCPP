@@ -1,314 +1,127 @@
-# XXX: Transcription runs on worker threads. Qt widgets may only be touched from
-# the main thread, so workers talk to the UI exclusively through the Qt signals
-# on `_JobSignals`; Qt queues those onto the main thread automatically.
+# XXX: Transcription runs on one worker thread. Qt widgets may only be touched
+# from the main thread, so the worker talks to the UI exclusively through the
+# Qt signals on `_JobSignals`; Qt queues those onto the main thread.
 
 import os
 import queue
-import subprocess
 import sys
 import threading
+import time
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QObject, Qt, Signal
 
+from uiwhispercpp import app_log
 from uiwhispercpp.audio_formats import expand_paths, file_dialog_filter
+from uiwhispercpp.gui.bottom_bar import BottomBar
+from uiwhispercpp.gui.debug_log import show_debug_log
 from uiwhispercpp.gui.file_queue import (
   DONE,
   FAILED,
+  FINISHED_STATES,
   INDETERMINATE,
   QUEUED,
   RUNNING,
+  STOPPED,
   FileQueue,
   Job,
 )
 from uiwhispercpp.gui.settings_dialog import SettingsDialog
-from uiwhispercpp.gui.theme import DANGER, apply_theme
-from uiwhispercpp.gui.widgets import SHORT_TEXT_ROLE, CompactComboBox, ElidedLabel
-from uiwhispercpp.models import Diarizer, ModelManager, Segment, label_segments
-from uiwhispercpp.models.diarization import AUTO_SPEAKERS
+from uiwhispercpp.gui.theme import ACCENT, apply_theme
+from uiwhispercpp.gui.transcript_pane import TranscriptPane, open_file, reveal_in_finder
+from uiwhispercpp.models import (
+  Diarizer,
+  JobStopped,
+  ModelManager,
+  Segment,
+  StopToken,
+  UserFacingError,
+  label_segments,
+)
 from uiwhispercpp.settings import Settings
 from uiwhispercpp.transcript import (
-  FILE_SRT,
   Line,
   OutputOptions,
   lines_from_segments,
   lines_from_turns,
-  render_line,
-  render_transcript,
-  save_transcript,
+  numbered_path,
+  transcript_path_for,
+  write_transcript,
 )
 
-LANGUAGES = [
-  ("Auto-detect language", ""),
-  ("English", "en"),
-  ("Ukrainian", "uk"),
-  ("Swedish", "sv"),
-  ("Russian", "ru"),
-]
-# 0 in the spin box means "I don't know how many speakers" -> auto-detect.
-_AUTO_SPEAKERS_SPIN = 0
-_MAX_SPEAKERS = 20
-# Most recordings people separate are two-person conversations, and pinning
-# the count is far more reliable than auto-detect.
-_DEFAULT_SPEAKERS_SPIN = 2
+log = app_log.get("jobs")
+
+# Partial transcripts are rewritten at most this often while a file runs.
+_PARTIAL_SAVE_SECONDS = 2.0
+_GENERIC_ERROR = (
+  "Something went wrong with this file.\n"
+  "Details are in Help > Debug Log. Try again, or try another model."
+)
 
 
 class _JobSignals(QObject):
-  started = Signal(int)
   status = Signal(int, str)
   progress = Signal(int, int)          # job id, percent or INDETERMINATE
   line = Signal(int, object)           # job id, Line
   lines_replaced = Signal(int, object)  # job id, list[Line]
+  warning = Signal(int, str)
   finished = Signal(int)
   failed = Signal(int, str)
+  stopped = Signal(int)
 
 
-class _BottomBar(QtWidgets.QWidget):
-  """Model, language and speaker controls, plus the Settings button."""
+class _DropOverlay(QtWidgets.QWidget):
+  """Accent frame shown over the window while files are dragged onto it."""
 
-  def __init__(self, manager: ModelManager, settings: Settings) -> None:
-    super().__init__()
-    self.setObjectName("BottomBar")
-    self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-    self._settings = settings
-    self.models = manager.available_models()
+  def __init__(self, parent: QtWidgets.QWidget) -> None:
+    super().__init__(parent)
+    self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    self.hide()
 
-    self.model = CompactComboBox()
-    model_items = self.model.model()
-    for index, option in enumerate(self.models):
-      label = option.label
-      if option.unavailable_reason:
-        label = f"{label} - not supported on this Mac"
-      self.model.addItem(label, option.key)
-      self.model.setItemData(index, option.short_label or option.label, SHORT_TEXT_ROLE)
-      if option.unavailable_reason:
-        item = model_items.item(index)
-        item.setEnabled(False)
-        item.setToolTip(option.unavailable_reason)
-    saved = str(settings.value("ui/model", ""))
-    usable = {o.key for o in self.models if not o.unavailable_reason}
-    chosen = saved if saved in usable else manager.default_model_key()
-    self.model.setCurrentIndex(max(0, self.model.findData(chosen)))
-    self.model.setToolTip("Transcription model")
-
-    self.language = QtWidgets.QComboBox()
-    for label, code in LANGUAGES:
-      self.language.addItem(label, code)
-    self.language.setCurrentIndex(
-      max(0, self.language.findData(str(settings.value("ui/language", ""))))
-    )
-    self.language.setToolTip("Spoken language (Parakeet detects it automatically)")
-
-    self.diarize = QtWidgets.QCheckBox("Separate speakers")
-    self.diarize.setChecked(str(settings.value("ui/diarize", "false")).lower() == "true")
-    self.speakers = QtWidgets.QSpinBox()
-    self.speakers.setRange(_AUTO_SPEAKERS_SPIN, _MAX_SPEAKERS)
-    self.speakers.setSpecialValueText("Auto")
-    self.speakers.setValue(int(settings.value("ui/speakers", _DEFAULT_SPEAKERS_SPIN)))
-    self.speakers.setToolTip(
-      "How many people are in the recording. The exact count gives the cleanest "
-      "separation; 'Auto' guesses but is less reliable. Voices that sound "
-      "identical are not split apart."
-    )
-    self.speakers.setEnabled(self.diarize.isChecked())
-    self.diarize.toggled.connect(self.speakers.setEnabled)
-
-    self.settings_button = QtWidgets.QToolButton()
-    self.settings_button.setObjectName("Flat")
-    self.settings_button.setText("Settings")
-    self.settings_button.setToolTip("Output format and updates (⌘,)")
-
-    layout = QtWidgets.QHBoxLayout(self)
-    layout.setContentsMargins(12, 8, 12, 8)
-    layout.setSpacing(10)
-    layout.addWidget(self.model)
-    layout.addWidget(self.language)
-    layout.addSpacing(6)
-    layout.addWidget(self.diarize)
-    layout.addWidget(self.speakers)
-    layout.addStretch()
-    layout.addWidget(self.settings_button)
-
-    self.model.currentIndexChanged.connect(self._persist)
-    self.language.currentIndexChanged.connect(self._persist)
-    self.diarize.toggled.connect(self._persist)
-    self.speakers.valueChanged.connect(self._persist)
-
-  def _persist(self) -> None:
-    self._settings.set_value("ui/model", self.model_key())
-    self._settings.set_value("ui/language", self.language_code())
-    self._settings.set_value("ui/diarize", "true" if self.diarize.isChecked() else "false")
-    self._settings.set_value("ui/speakers", self.speakers.value())
-
-  def model_key(self) -> str:
-    return self.model.currentData()
-
-  def language_code(self) -> str:
-    return self.language.currentData()
-
-  def num_speakers(self) -> int | None:
-    """None when not separating speakers; AUTO_SPEAKERS for auto-detect."""
-    if not self.diarize.isChecked():
-      return None
-    value = self.speakers.value()
-    return AUTO_SPEAKERS if value == _AUTO_SPEAKERS_SPIN else value
+  def paintEvent(self, event) -> None:
+    painter = QtGui.QPainter(self)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    accent = QtGui.QColor(ACCENT)
+    fill = QtGui.QColor(accent)
+    fill.setAlphaF(0.07)
+    painter.setBrush(fill)
+    pen = QtGui.QPen(accent, 2)
+    painter.setPen(pen)
+    painter.drawRoundedRect(self.rect().adjusted(6, 6, -6, -6), 12, 12)
+    font = painter.font()
+    font.setPointSizeF(font.pointSizeF() + 4)
+    font.setWeight(QtGui.QFont.Weight.DemiBold)
+    painter.setFont(font)
+    painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drop to transcribe")
 
 
-class _TranscriptPane(QtWidgets.QWidget):
-  """Right pane: the selected file's transcript, live while it is produced."""
+class _Toast(QtWidgets.QLabel):
+  """A short message floating at the bottom of the window, hard to miss."""
 
-  def __init__(self) -> None:
-    super().__init__()
-    self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-    self.job: Job | None = None
-    self.options = OutputOptions()
+  def __init__(self, parent: QtWidgets.QWidget) -> None:
+    super().__init__(parent)
+    self.setObjectName("Toast")
+    self.setWordWrap(True)
+    self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    self.hide()
+    self._timer = QtCore.QTimer(self)
+    self._timer.setSingleShot(True)
+    self._timer.timeout.connect(self.hide)
 
-    self.title = ElidedLabel()
-    self.title.setObjectName("FileTitle")
-    self.status = ElidedLabel(mode=Qt.TextElideMode.ElideRight)
-    self.status.setObjectName("FileStatus")
-    self.error = QtWidgets.QLabel()
-    self.error.setStyleSheet(f"color: {DANGER};")
-    self.error.setWordWrap(True)
-    self.error.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+  def show_text(self, text: str, seconds: float = 6) -> None:
+    self.setText(text)
+    self.reposition()
+    self.show()
+    self.raise_()
+    self._timer.start(int(seconds * 1000))
 
-    self.copy_button = self._flat_button("Copy", self._copy)
-    self.open_button = self._flat_button("Open", self._open)
-    self.reveal_button = self._flat_button("Show in Finder", self._reveal)
-
-    title_row = QtWidgets.QHBoxLayout()
-    title_row.addWidget(self.title, 1)
-    for button in (self.copy_button, self.open_button, self.reveal_button):
-      title_row.addWidget(button)
-    # The status gets the full pane width on its own line, so it stays
-    # readable even at the smallest window size.
-    header = QtWidgets.QVBoxLayout()
-    header.setSpacing(2)
-    header.addLayout(title_row)
-    header.addWidget(self.status)
-
-    self.text = QtWidgets.QPlainTextEdit()
-    self.text.setObjectName("Transcript")
-    self.text.setReadOnly(True)
-    self.text.setUndoRedoEnabled(False)
-    self.text.document().setDocumentMargin(2)
-    self.text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
-
-    self.empty = QtWidgets.QLabel("Select a file to see its transcript")
-    self.empty.setObjectName("FileStatus")
-    self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-    content = QtWidgets.QWidget()
-    content_layout = QtWidgets.QVBoxLayout(content)
-    content_layout.setContentsMargins(20, 16, 16, 8)
-    content_layout.setSpacing(10)
-    content_layout.addLayout(header)
-    content_layout.addWidget(self.error)
-    content_layout.addWidget(self.text, 1)
-
-    self.stack = QtWidgets.QStackedLayout(self)
-    self.stack.addWidget(self.empty)
-    self.stack.addWidget(content)
-    self.show_job(None)
-
-  def _flat_button(self, text: str, slot) -> QtWidgets.QPushButton:
-    button = QtWidgets.QPushButton(text)
-    button.setObjectName("Flat")
-    button.setCursor(Qt.CursorShape.PointingHandCursor)
-    button.clicked.connect(slot)
-    return button
-
-  def _display_options(self) -> OutputOptions:
-    # A saved file is shown exactly as it was written.
-    if self.job is not None and self.job.saved_options is not None:
-      return self.job.saved_options
-    return self.options
-
-  def set_options(self, options: OutputOptions) -> None:
-    self.options = options
-    self.show_job(self.job)
-
-  def show_job(self, job: Job | None) -> None:
-    # Re-showing the same file (e.g. speaker labels replacing the live lines)
-    # keeps the reader at the bottom if that's where they were.
-    bar = self.text.verticalScrollBar()
-    stay_at_bottom = job is not None and job is self.job and bar.value() >= bar.maximum() - 30
-    self.job = job
-    if job is None:
-      self.stack.setCurrentIndex(0)
-      return
-    self.stack.setCurrentIndex(1)
-    self.title.setText(job.name)
-    self.title.setToolTip(job.path)
-    self.text.setPlainText(render_transcript(job.lines, self._display_options()))
-    self.refresh_status()
-    if job.state == RUNNING or stay_at_bottom:
-      self._scroll_to_bottom()
-
-  def refresh_status(self) -> None:
-    job = self.job
-    if job is None:
-      return
-    status = job.status
-    if job.state == RUNNING and job.progress != INDETERMINATE:
-      status = f"{status}  {job.progress}%"
-    if job.state == DONE and job.output_path:
-      status = f"Saved as {os.path.basename(job.output_path)}"
-    self.status.setText(status)
-    if job.output_path:
-      self.status.setToolTip(job.output_path)
-    self.error.setVisible(bool(job.error))
-    self.error.setText(job.error or "")
-    has_text = bool(job.lines)
-    self.copy_button.setEnabled(has_text)
-    has_file = bool(job.output_path) and os.path.exists(job.output_path or "")
-    self.open_button.setEnabled(has_file)
-    self.reveal_button.setEnabled(True)
-    if job.state == QUEUED and not job.lines:
-      self.text.setPlaceholderText("Waiting for its turn...")
-    elif job.state == RUNNING and not job.lines:
-      self.text.setPlaceholderText("The transcript appears here as it's produced...")
-    else:
-      self.text.setPlaceholderText("")
-
-  def append_line(self, line: Line) -> None:
-    """Append one live line without re-rendering the whole transcript."""
-    options = self._display_options()
-    bar = self.text.verticalScrollBar()
-    at_bottom = bar.value() >= bar.maximum() - 30
-    if options.file_type == FILE_SRT:
-      # Cheap enough to re-render: SRT numbering depends on position.
-      self.text.setPlainText(render_transcript(self.job.lines, options))
-    else:
-      self.text.appendPlainText(render_line(line, options))
-    if at_bottom:
-      self._scroll_to_bottom()
-
-  def _scroll_to_bottom(self) -> None:
-    bar = self.text.verticalScrollBar()
-    bar.setValue(bar.maximum())
-
-  def _copy(self) -> None:
-    QtWidgets.QApplication.clipboard().setText(self.text.toPlainText())
-    self.copy_button.setText("Copied")
-    QtCore.QTimer.singleShot(1200, lambda: self.copy_button.setText("Copy"))
-
-  def _open(self) -> None:
-    if self.job and self.job.output_path:
-      QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self.job.output_path))
-
-  def _reveal(self) -> None:
-    if self.job is None:
-      return
-    target = self.job.output_path if self.job.output_path else self.job.path
-    reveal_in_finder(target)
-
-
-def reveal_in_finder(path: str) -> None:
-  if sys.platform == "darwin" and os.path.exists(path):
-    subprocess.Popen(["open", "-R", path])
-  else:
-    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(path)))
+  def reposition(self) -> None:
+    parent = self.parentWidget()
+    width = min(520, parent.width() - 40)
+    self.setFixedWidth(width)
+    self.adjustSize()
+    self.move((parent.width() - width) // 2, parent.height() - self.height() - 70)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -322,28 +135,33 @@ class MainWindow(QtWidgets.QMainWindow):
     self.settings = Settings()
     self.model_manager = ModelManager()
     self.diarizer = Diarizer()
-    # One long-lived worker thread runs every job. MLX (Parakeet) keeps its GPU
-    # stream per thread, so a fresh thread per file breaks after a failure.
-    self._work_queue: queue.Queue = queue.Queue()
-    threading.Thread(target=self._worker_loop, daemon=True).start()
     self.jobs: dict[int, Job] = {}
     self._next_id = 1
     self._running: Job | None = None
-    # Follow the running file in the right pane until the user picks another.
     self._follow_running = True
     self._settings_dialog: SettingsDialog | None = None
+    self._choosing_target = False
+    # "replace" / "keep" once the user ticks "do the same for the rest".
+    self._clash_choice: str | None = None
+    self._pending_update: tuple[str, str] | None = None
 
     self.signals = _JobSignals()
-    self.signals.started.connect(self._on_started)
     self.signals.status.connect(self._on_status)
     self.signals.progress.connect(self._on_progress)
     self.signals.line.connect(self._on_line)
     self.signals.lines_replaced.connect(self._on_lines_replaced)
+    self.signals.warning.connect(self._on_warning)
     self.signals.finished.connect(self._on_finished)
     self.signals.failed.connect(self._on_failed)
+    self.signals.stopped.connect(self._on_stopped)
+
+    self._work_queue: queue.Queue = queue.Queue()
+    self._worker: threading.Thread | None = None
+    self._ensure_worker()
 
     self._build_ui()
     self._build_menu()
+    self._refresh_empty_state()
 
   # ---------- layout ----------
 
@@ -351,49 +169,54 @@ class MainWindow(QtWidgets.QMainWindow):
     self.queue = FileQueue()
     self.queue.itemSelectionChanged.connect(self._on_selection_changed)
     self.queue.customContextMenuRequested.connect(self._show_queue_menu)
+    self.queue.itemDoubleClicked.connect(self._on_double_click)
 
-    files_title = QtWidgets.QLabel("FILES")
+    files_title = QtWidgets.QLabel("Files")
     files_title.setObjectName("PaneTitle")
-    add_files = QtWidgets.QPushButton("Add files...")
-    add_files.setObjectName("Add")
-    add_files.clicked.connect(self.add_files_dialog)
-    add_folder = QtWidgets.QPushButton("Add folder...")
-    add_folder.setObjectName("Add")
-    add_folder.clicked.connect(self.add_folder_dialog)
-    add_row = QtWidgets.QHBoxLayout()
-    add_row.setSpacing(6)
-    add_row.addWidget(add_files)
-    add_row.addWidget(add_folder)
+    self.clear_button = QtWidgets.QPushButton("Clear")
+    self.clear_button.setObjectName("Quiet")
+    self.clear_button.setToolTip("Remove finished files from the list (not from disk)")
+    self.clear_button.clicked.connect(self.clear_finished)
+    self.clear_button.hide()
+    add_menu = QtWidgets.QMenu(self)
+    add_menu.addAction("Add Files…", self.add_files_dialog)
+    add_menu.addAction("Add Folder…", self.add_folder_dialog)
+    add_button = QtWidgets.QToolButton()
+    add_button.setObjectName("Plus")
+    add_button.setText("+")
+    add_button.setToolTip("Add files or a folder (⌘O)")
+    add_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+    add_button.setMenu(add_menu)
+
+    title_row = QtWidgets.QHBoxLayout()
+    title_row.setContentsMargins(10, 0, 2, 0)
+    title_row.addWidget(files_title)
+    title_row.addStretch()
+    title_row.addWidget(self.clear_button)
+    title_row.addWidget(add_button)
+    title_bar = QtWidgets.QWidget()
+    title_bar.setFixedHeight(30)
+    title_bar.setLayout(title_row)
+
 
     sidebar = QtWidgets.QWidget()
     sidebar.setObjectName("Sidebar")
     sidebar_layout = QtWidgets.QVBoxLayout(sidebar)
-    sidebar_layout.setContentsMargins(8, 14, 8, 10)
-    sidebar_layout.setSpacing(8)
-    title_row = QtWidgets.QHBoxLayout()
-    title_row.setContentsMargins(10, 0, 4, 0)
-    title_row.addWidget(files_title)
-    title_row.addStretch()
-    self.clear_button = QtWidgets.QPushButton("Clear finished")
-    self.clear_button.setObjectName("Flat")
-    self.clear_button.clicked.connect(self.clear_finished)
-    self.clear_button.hide()
-    title_row.addWidget(self.clear_button)
-    sidebar_layout.addLayout(title_row)
+    sidebar_layout.setContentsMargins(8, 10, 8, 10)
+    sidebar_layout.setSpacing(6)
+    sidebar_layout.addWidget(title_bar)
     sidebar_layout.addWidget(self.queue, 1)
-    # Short-lived notes ("No supported audio files...") appear right where the
-    # user just added files; hidden otherwise so nothing else moves around.
-    self.note = QtWidgets.QLabel()
-    self.note.setObjectName("FileStatus")
-    self.note.setWordWrap(True)
-    self.note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.note.hide()
-    sidebar_layout.addWidget(self.note)
-    sidebar_layout.addLayout(add_row)
+    sidebar.setMinimumWidth(200)
 
-    self.pane = _TranscriptPane()
+    self.pane = TranscriptPane()
     self.pane.setObjectName("Pane")
     self.pane.set_options(self.settings.output_options())
+    self.pane.welcome.choose_files.connect(self.add_files_dialog)
+    self.pane.welcome.choose_folder.connect(self.add_folder_dialog)
+    self.pane.stop_requested.connect(self.stop_job)
+    self.pane.retry_requested.connect(self._retry)
+    self.pane.remove_requested.connect(self._remove)
+    self.pane.save_as_requested.connect(self._save_as)
 
     splitter = QtWidgets.QSplitter()
     splitter.setHandleWidth(1)
@@ -401,11 +224,11 @@ class MainWindow(QtWidgets.QMainWindow):
     splitter.addWidget(sidebar)
     splitter.addWidget(self.pane)
     splitter.setStretchFactor(1, 1)
-    splitter.setSizes([290, 650])
-    sidebar.setMinimumWidth(220)
+    splitter.setSizes([250, 690])
 
-    self.bottom = _BottomBar(self.model_manager, self.settings)
+    self.bottom = BottomBar(self.model_manager, self.settings)
     self.bottom.settings_button.clicked.connect(lambda: self.open_settings(0))
+    self.bottom.changed.connect(self._on_bar_changed)
 
     central = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(central)
@@ -414,47 +237,67 @@ class MainWindow(QtWidgets.QMainWindow):
     layout.addWidget(splitter, 1)
     layout.addWidget(self.bottom)
     self.setCentralWidget(central)
+    self.overlay = _DropOverlay(central)
+    self.toast = _Toast(central)
 
   def _build_menu(self) -> None:
     menu_bar = self.menuBar()
     file_menu = menu_bar.addMenu("File")
-    add_files = file_menu.addAction("Add Files...", self.add_files_dialog)
+    add_files = file_menu.addAction("Add Files…", self.add_files_dialog)
     add_files.setShortcut(QtGui.QKeySequence.StandardKey.Open)
-    add_folder = file_menu.addAction("Add Folder...", self.add_folder_dialog)
+    add_folder = file_menu.addAction("Add Folder…", self.add_folder_dialog)
     add_folder.setShortcut(QtGui.QKeySequence("Ctrl+Shift+O"))
     file_menu.addSeparator()
     file_menu.addAction("Clear Finished", self.clear_finished)
-    # macOS moves these into the application menu (UIWhisperCPP > Settings...).
-    settings_action = file_menu.addAction("Settings...", lambda: self.open_settings(0))
+    # macOS moves these into the application menu (UIWhisperCPP > Settings…).
+    settings_action = file_menu.addAction("Settings…", lambda: self.open_settings(0))
     settings_action.setShortcut(QtGui.QKeySequence.StandardKey.Preferences)
     settings_action.setMenuRole(QtGui.QAction.MenuRole.PreferencesRole)
-    updates_action = file_menu.addAction("Check for Updates...", lambda: self.open_settings(1))
+    updates_action = file_menu.addAction("Check for Updates…", lambda: self.open_settings(1))
     updates_action.setMenuRole(QtGui.QAction.MenuRole.ApplicationSpecificRole)
+    help_menu = menu_bar.addMenu("Help")
+    debug_action = help_menu.addAction("Debug Log", show_debug_log)
+    debug_action.setShortcut(QtGui.QKeySequence("Ctrl+Alt+L"))
+
+  def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+    super().resizeEvent(event)
+    self.overlay.setGeometry(self.centralWidget().rect())
+    if self.toast.isVisible():
+      self.toast.reposition()
 
   # ---------- adding files ----------
 
   def add_files_dialog(self) -> None:
     paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-      self, "Add audio files", self._last_dir(), file_dialog_filter()
+      self, "Choose Audio or Video Files", self._last_dir(), file_dialog_filter()
     )
     self.add_paths(paths)
 
   def add_folder_dialog(self) -> None:
-    folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Add folder", self._last_dir())
+    folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose a Folder", self._last_dir())
     if folder:
       self.add_paths([folder])
 
   def _last_dir(self) -> str:
-    return str(self.settings.value("ui/last_dir", os.path.expanduser("~")))
+    last = self.settings.text("ui/last_dir")
+    return last if last and os.path.isdir(last) else os.path.expanduser("~")
 
   def add_paths(self, paths: list[str]) -> int:
     """Queue every audio file among `paths` (folders expand). Returns how many."""
     if not paths:
       return 0
     self.settings.set_value("ui/last_dir", os.path.dirname(paths[0].rstrip("/")))
-    files = expand_paths(paths)
+    files, unreadable = expand_paths(paths)
+    for folder in unreadable:
+      log.warning("Can't read folder %s", folder)
     if not files:
-      self.flash("No supported audio files found there.")
+      if unreadable:
+        self.flash(
+          f"Couldn't open “{os.path.basename(unreadable[0].rstrip('/'))}”. "
+          "Allow access in System Settings > Privacy & Security, then try again."
+        )
+      else:
+        self.flash("Nothing to add: those aren't audio or video files.")
       return 0
     already = {job.path for job in self.jobs.values() if job.state in (QUEUED, RUNNING)}
     added = 0
@@ -466,39 +309,59 @@ class MainWindow(QtWidgets.QMainWindow):
       self.jobs[job.id] = job
       self.queue.add_job(job)
       added += 1
+    log.info("Added %d file(s)", added)
     if added and self.queue.selected_job() is None:
       self._follow_running = True
+    self._refresh_empty_state()
     self._start_next()
     return added
 
   def flash(self, text: str) -> None:
-    self.note.setText(text)
-    self.note.show()
-    QtCore.QTimer.singleShot(4000, self.note.hide)
+    self.toast.show_text(text)
 
   def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
     if event.mimeData().hasUrls():
       event.acceptProposedAction()
+      self.overlay.setGeometry(self.centralWidget().rect())
+      self.overlay.show()
+      self.overlay.raise_()
+
+  def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent) -> None:
+    self.overlay.hide()
 
   def dropEvent(self, event: QtGui.QDropEvent) -> None:
-    paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+    self.overlay.hide()
+    urls = event.mimeData().urls()
+    paths = [url.toLocalFile() for url in urls if url.isLocalFile()]
+    if urls and not paths:
+      self.flash("Only files on this Mac can be added. Download them first.")
     self.add_paths(paths)
     event.acceptProposedAction()
 
   # ---------- queue actions ----------
 
   def clear_finished(self) -> None:
-    for job in [j for j in self.jobs.values() if j.state in (DONE, FAILED)]:
+    for job in [j for j in self.jobs.values() if j.state in FINISHED_STATES]:
       self._remove(job)
 
   def _remove(self, job: Job) -> None:
-    if job.state == RUNNING:
+    if job is None or job.state == RUNNING:
       return
     self.jobs.pop(job.id, None)
     self.queue.remove_job(job.id)
     if self.pane.job is job:
-      self.pane.show_job(self.queue.selected_job())
-    self._update_clear_button()
+      self.pane.job = None
+    self._refresh_empty_state()
+    if not self.is_busy() and not any(j.state == QUEUED for j in self.jobs.values()):
+      self._queue_idle()
+
+  def stop_job(self, job: Job) -> None:
+    if job is None or job.state != RUNNING or job.stop_token is None:
+      return
+    log.info("Job %s: stop requested", job.id)
+    job.stop_token.stop()
+    job.status = "Stopping…"
+    self._refresh(job)
 
   def _show_queue_menu(self, position: QtCore.QPoint) -> None:
     item = self.queue.itemAt(position)
@@ -506,76 +369,242 @@ class MainWindow(QtWidgets.QMainWindow):
       return
     job = self.queue.job_at(self.queue.row(item))
     menu = QtWidgets.QMenu(self)
-    if job.output_path:
-      menu.addAction("Open Transcript", lambda: QtGui.QDesktopServices.openUrl(
-        QtCore.QUrl.fromLocalFile(job.output_path)))
+    if job.state == RUNNING:
+      menu.addAction("Stop", lambda: self.stop_job(job))
+    if job.output_path and os.path.exists(job.output_path):
+      menu.addAction("Open Transcript", lambda: open_file(job.output_path))
     menu.addAction("Show in Finder", lambda: reveal_in_finder(job.output_path or job.path))
-    if job.state == FAILED:
-      menu.addAction("Try Again", lambda: self._retry(job))
+    if job.state in FINISHED_STATES:
+      menu.addAction("Transcribe Again", lambda: self._retry(job))
     if job.state != RUNNING:
       menu.addSeparator()
       menu.addAction("Remove from List", lambda: self._remove(job))
     menu.exec(self.queue.viewport().mapToGlobal(position))
 
+  def _on_double_click(self, item: QtWidgets.QListWidgetItem) -> None:
+    job = self.queue.job_at(self.queue.row(item))
+    if job and job.output_path and os.path.exists(job.output_path):
+      open_file(job.output_path)
+
   def _retry(self, job: Job) -> None:
-    job.state, job.status, job.error, job.lines = QUEUED, "Waiting", None, []
-    job.progress = INDETERMINATE
+    if job is None or job.state not in FINISHED_STATES:
+      return
+    job.state, job.status, job.error, job.warning = QUEUED, "Waiting", None, None
+    job.lines, job.progress = [], INDETERMINATE
+    job.output_path, job.saved_options = None, None
     self._refresh(job)
+    if self.pane.job is job:
+      self.pane.show_job(job)
     self._start_next()
 
-  def _update_clear_button(self) -> None:
-    self.clear_button.setVisible(any(j.state in (DONE, FAILED) for j in self.jobs.values()))
+  def _save_as(self, job: Job) -> None:
+    if job is None or not job.lines:
+      return
+    options = self.settings.output_options()
+    suggested = os.path.join(
+      os.path.expanduser("~/Documents"),
+      os.path.basename(transcript_path_for(job.path, options)),
+    )
+    path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Transcript", suggested)
+    if not path:
+      return
+    try:
+      job.output_path = write_transcript(path, job.lines, options)
+      job.saved_options = options
+      job.state, job.error = DONE, None
+      job.status = "Done"
+    except OSError as error:
+      job.error = f"Couldn't save there either.\n{error.strerror or error}"
+    self._refresh(job)
+    if self.pane.job is job:
+      self.pane.show_job(job)
+    if not self.is_busy():
+      self._queue_idle()
 
   def _on_selection_changed(self) -> None:
     job = self.queue.selected_job()
     self._follow_running = job is None or job is self._running
-    self.pane.show_job(job)
+    if job is None:
+      self.pane.show_empty(bool(self.jobs))
+    else:
+      self.pane.show_job(job)
+
+  def _refresh_empty_state(self) -> None:
+    self.clear_button.setVisible(any(j.state in FINISHED_STATES for j in self.jobs.values()))
+    self.pane.set_first_run(not self.settings.flag("ui/onboarded", False))
+    if self.queue.selected_job() is None:
+      self.pane.show_empty(bool(self.jobs))
+    self._update_title()
+
+  def _update_title(self) -> None:
+    active = [j for j in self.jobs.values() if j.state in (QUEUED, RUNNING)]
+    if self._running is not None:
+      done = sum(1 for j in self.jobs.values() if j.state in FINISHED_STATES)
+      total = done + len(active)
+      self.setWindowTitle(f"Transcribing {done + 1} of {total} - UIWhisperCPP")
+    else:
+      self.setWindowTitle("UIWhisperCPP")
+
+  def _on_bar_changed(self) -> None:
+    if self._running is not None:
+      self.flash("Changes apply to the next file. Use Transcribe Again to redo this one.")
 
   # ---------- running jobs ----------
 
   def is_busy(self) -> bool:
     return self._running is not None
 
+  def _ensure_worker(self) -> None:
+    """(Re)start the single worker thread if it isn't running."""
+    if self._worker is None or not self._worker.is_alive():
+      self._worker = threading.Thread(target=self._worker_loop, name="transcriber", daemon=True)
+      self._worker.start()
+
+  def _worker_loop(self) -> None:
+    # One long-lived thread runs every job: MLX (Parakeet) keeps its GPU stream
+    # per thread, so a fresh thread per file breaks after a failure.
+    while True:
+      args = self._work_queue.get()
+      try:
+        self._work(*args)
+      except BaseException:  # noqa: BLE001 - never let the worker die silently
+        log.exception("Worker crashed while running job %s", args[0])
+        self.signals.failed.emit(args[0], _GENERIC_ERROR)
+
   def _start_next(self) -> None:
-    if self._running is not None:
+    if self._running is not None or self._choosing_target:
       return
     job = next((j for j in self.jobs.values() if j.state == QUEUED), None)
     if job is None:
+      self._queue_idle()
       return
     model_key = self.bottom.model_key()
     if not model_key:
       return
+    options = self.settings.output_options()
+    if job.target_path is None:
+      self._choosing_target = True
+      try:
+        target = self._choose_target(job, options)
+      finally:
+        self._choosing_target = False
+      if target is None:
+        job.state, job.status = STOPPED, "Skipped"
+        job.error = None
+        self._refresh(job)
+        self._refresh_empty_state()
+        QtCore.QTimer.singleShot(0, self._start_next)
+        return
+      job.target_path = target
+    elif os.path.splitext(job.target_path)[1] != "." + options.file_type:
+      # The output format changed since the name was chosen: the new name may
+      # belong to someone else's file, so it goes through the clash check again.
+      job.target_path = None
+      self._start_next()
+      return
+    self._ensure_worker()
     self._running = job
-    job.state, job.status, job.progress = RUNNING, "Starting...", INDETERMINATE
-    job.lines, job.error, job.output_path, job.saved_options = [], None, None, None
+    job.state, job.status, job.progress = RUNNING, "Getting ready…", INDETERMINATE
+    job.lines, job.error, job.warning = [], None, None
+    job.output_path, job.saved_options = None, options
+    job.stop_token = StopToken()
+    job.summary = self.bottom.summary()
     self._refresh(job)
-    if self._follow_running:
+    if self._follow_running or self.queue.selected_job() is None:
       self.queue.select_job(job.id)
+    self._update_title()
     snapshot = dict(
       model_key=model_key,
       language=self.bottom.language_code(),
       num_speakers=self.bottom.num_speakers(),
-      options=self.settings.output_options(),
+      options=options,
+      target=job.target_path,
+      stop=job.stop_token,
     )
     self._work_queue.put((job.id, job.path, snapshot))
 
-  def _worker_loop(self) -> None:
-    while True:
-      self._work(*self._work_queue.get())
+  def _choose_target(self, job: Job, options: OutputOptions) -> str | None:
+    """Where to save; asks when a file with that name already exists.
+
+    Returns None when the user chose to skip this file.
+    """
+    target = transcript_path_for(job.path, options)
+    # Another file in this list already writes there: never share a target.
+    claimed = {
+      j.target_path for j in self.jobs.values() if j is not job and j.target_path
+    }
+    while target in claimed:
+      target = numbered_path(target, taken=claimed)
+    if not os.path.exists(target):
+      return target
+    if self._clash_choice == "replace":
+      return target
+    if self._clash_choice == "keep":
+      return numbered_path(target, taken=claimed)
+    if self._clash_choice == "skip":
+      return None
+    alternative = numbered_path(target, taken=claimed)
+    box = QtWidgets.QMessageBox(self)
+    box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+    box.setWindowTitle("A transcript already exists")
+    box.setText("A transcript of this recording already exists.")
+    box.setInformativeText(
+      f"Replace “{os.path.basename(target)}”, or keep both (the new one is "
+      f"saved as “{os.path.basename(alternative)}”)?"
+    )
+    keep = box.addButton("Keep Both", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+    replace = box.addButton("Replace", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+    skip = box.addButton("Skip This File", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(keep)
+    box.setEscapeButton(skip)
+    others = sum(1 for j in self.jobs.values() if j.state == QUEUED and j is not job)
+    remember = None
+    if others:
+      remember = QtWidgets.QCheckBox("Do the same for the other files")
+      box.setCheckBox(remember)
+    box.exec()
+    clicked = box.clickedButton()
+    choice = "skip" if clicked is skip else "replace" if clicked is replace else "keep"
+    if remember is not None and remember.isChecked():
+      self._clash_choice = choice
+    if choice == "skip":
+      return None
+    log.info("Job %s: name clash on %s -> %s", job.id, target, choice)
+    return target if choice == "replace" else alternative
 
   def _work(self, job_id: int, audio_path: str, snapshot: dict) -> None:
     """Worker thread: transcribe one file. Talks to the UI only via signals."""
     signals = self.signals
     options: OutputOptions = snapshot["options"]
+    target: str = snapshot["target"]
+    stop: StopToken = snapshot["stop"]
+    log.info(
+      "Job %s start: %s | model=%s language=%s speakers=%s output=%s -> %s",
+      job_id, audio_path, snapshot["model_key"], snapshot["language"] or "auto",
+      snapshot["num_speakers"], options, target,
+    )
     live: list[Segment] = []
-    try:
-      signals.started.emit(job_id)
+    last_save = 0.0
+    save_failed = False
 
+    def save_partial(force: bool = False) -> None:
+      # Partial saves protect against crashes; a failure here must never
+      # abort the transcription itself (the text is still kept in the UI).
+      nonlocal last_save, save_failed
+      if save_failed or (not force and time.monotonic() - last_save < _PARTIAL_SAVE_SECONDS):
+        return
+      try:
+        write_transcript(target, lines_from_segments(live), options)
+        last_save = time.monotonic()
+      except OSError as error:
+        save_failed = True
+        log.warning("Job %s: can't write partial transcript: %s", job_id, error)
+
+    try:
       def on_segment(segment: Segment) -> None:
         live.append(segment)
         signals.line.emit(job_id, lines_from_segments([segment])[0])
-        # Save as we go: if the run dies midway, the partial transcript survives.
-        save_transcript(audio_path, lines_from_segments(live), options)
+        save_partial()
 
       def on_progress(percent: int) -> None:
         signals.progress.emit(job_id, int(percent))
@@ -587,25 +616,59 @@ class MainWindow(QtWidgets.QMainWindow):
         on_segment=on_segment,
         on_progress=on_progress,
         on_status=lambda text: signals.status.emit(job_id, text),
+        stop=stop,
       )
-      if snapshot["num_speakers"] is not None:
-        signals.status.emit(job_id, "Separating speakers...")
+      lines = lines_from_segments(segments)
+      if lines:
+        # Everything transcribed is on disk before the (slower) speaker step.
+        live[:] = segments
+        save_partial(force=True)
+      if snapshot["num_speakers"] is not None and lines:
+        signals.status.emit(job_id, "Separating speakers…")
         signals.progress.emit(job_id, INDETERMINATE)
-        speaker_segments = self.diarizer.diarize(
-          audio_path,
-          num_speakers=snapshot["num_speakers"],
-          on_progress=on_progress,
-          on_log=lambda text: signals.status.emit(job_id, text),
-        )
-        signals.lines_replaced.emit(
-          job_id, lines_from_turns(label_segments(segments, speaker_segments))
+        try:
+          speaker_segments = self.diarizer.diarize(
+            audio_path,
+            num_speakers=snapshot["num_speakers"],
+            on_progress=on_progress,
+            on_log=lambda text: signals.status.emit(job_id, text),
+            stop=stop,
+          )
+          lines = lines_from_turns(label_segments(segments, speaker_segments))
+        except JobStopped:
+          raise
+        except Exception as error:  # noqa: BLE001 - the transcript itself is fine
+          if stop.stopped:
+            raise JobStopped() from error
+          log.exception("Job %s: speaker separation failed", job_id)
+          reason = str(error) if isinstance(error, UserFacingError) else "an unexpected error"
+          signals.warning.emit(
+            job_id, f"Saved without speaker labels: separating speakers failed ({reason})."
+          )
+      signals.lines_replaced.emit(job_id, lines)
+      signals.finished.emit(job_id)
+    except JobStopped:
+      log.info("Job %s stopped by the user", job_id)
+      live_lines = lines_from_segments(live)
+      signals.lines_replaced.emit(job_id, live_lines)
+      signals.stopped.emit(job_id)
+    except Exception as error:  # noqa: BLE001 - routed below
+      if stop.stopped:
+        log.info("Job %s stopped by the user (%s)", job_id, type(error).__name__)
+        signals.lines_replaced.emit(job_id, lines_from_segments(live))
+        signals.stopped.emit(job_id)
+      elif isinstance(error, UserFacingError):
+        log.warning("Job %s failed: %s", job_id, error)
+        signals.failed.emit(job_id, str(error))
+      elif isinstance(error, MemoryError):
+        log.exception("Job %s ran out of memory", job_id)
+        signals.failed.emit(
+          job_id, "Your Mac ran out of memory for this model.\n"
+          "Close other apps or choose a smaller model, then try again.",
         )
       else:
-        signals.lines_replaced.emit(job_id, lines_from_segments(segments))
-      signals.finished.emit(job_id)
-    except Exception as error:  # noqa: BLE001 - every failure is shown per file
-      print(error, file=sys.stderr)
-      signals.failed.emit(job_id, str(error) or error.__class__.__name__)
+        log.exception("Job %s failed: %s", job_id, audio_path)
+        signals.failed.emit(job_id, _GENERIC_ERROR)
 
   def _job(self, job_id: int) -> Job | None:
     return self.jobs.get(job_id)
@@ -615,18 +678,20 @@ class MainWindow(QtWidgets.QMainWindow):
     if self.pane.job is job:
       self.pane.refresh_status()
 
-  def _on_started(self, job_id: int) -> None:
-    if job := self._job(job_id):
-      job.status = "Preparing..."
-      self._refresh(job)
-
   def _on_status(self, job_id: int, text: str) -> None:
-    if job := self._job(job_id):
-      job.status = text.strip()
+    text = text.strip().replace("...", "…")
+    log.info("Job %s: %s", job_id, text)
+    if (job := self._job(job_id)) and job.status != "Stopping…":
+      job.status = text
+      # Download messages carry their own percentage.
+      if "%" in text:
+        job.progress = INDETERMINATE
       self._refresh(job)
 
   def _on_progress(self, job_id: int, percent: int) -> None:
     if job := self._job(job_id):
+      if percent != INDETERMINATE and percent // 25 != max(job.progress, 0) // 25:
+        log.debug("Job %s: %s%%", job_id, percent)
       job.progress = percent if percent == INDETERMINATE else max(0, min(100, percent))
       self._refresh(job)
 
@@ -641,70 +706,204 @@ class MainWindow(QtWidgets.QMainWindow):
     if job := self._job(job_id):
       job.lines = list(lines)
 
+  def _on_warning(self, job_id: int, text: str) -> None:
+    if job := self._job(job_id):
+      job.warning = text
+
+  def _save_final(self, job: Job) -> bool:
+    """Write the job's transcript to its chosen path; record any failure."""
+    options = job.saved_options or self.settings.output_options()
+    try:
+      job.output_path = write_transcript(job.target_path, job.lines, options)
+      job.saved_options = options
+      return True
+    except OSError as error:
+      log.warning("Job %s: can't save %s: %s", job.id, job.target_path, error)
+      job.output_path = None
+      reason = error.strerror or str(error)
+      job.error = (
+        "Couldn't save the transcript next to the recording.\n"
+        f"The folder may be read-only or full ({reason}). Use Save As… to choose "
+        "another place, or Copy Text."
+      )
+      return False
+
   def _on_finished(self, job_id: int) -> None:
     job = self._job(job_id)
     if job is None:
       return
-    options = self.settings.output_options()
     try:
-      job.output_path = save_transcript(job.path, job.lines, options)
-      job.saved_options = options
-      job.state, job.status = DONE, "Done"
-    except OSError as error:
-      job.state, job.status, job.error = FAILED, "Couldn't save", str(error)
-    self._job_ended(job)
+      if not job.lines:
+        job.state, job.status = DONE, "No speech found"
+        job.warning = "No speech was found in this file, so nothing was saved."
+      elif self._save_final(job):
+        job.state, job.status = DONE, "Done"
+        self.settings.set_value("ui/onboarded", "true")
+      else:
+        job.state, job.status = FAILED, "Couldn't save"
+    finally:
+      self._job_ended(job)
 
   def _on_failed(self, job_id: int, message: str) -> None:
     job = self._job(job_id)
     if job is None:
       return
-    job.state, job.status, job.error = FAILED, "Failed", message
-    if job.lines:
-      job.output_path = save_transcript(job.path, job.lines, self.settings.output_options())
-      job.saved_options = self.settings.output_options()
-      job.error = f"{message}\nThe partial transcript was saved."
-    self._job_ended(job)
+    try:
+      job.state, job.status, job.error = FAILED, "Didn't finish", message
+      if job.lines and self._save_final(job):
+        job.error = message  # keep the original reason; the status names the file
+    finally:
+      self._job_ended(job)
+
+  def _on_stopped(self, job_id: int) -> None:
+    job = self._job(job_id)
+    if job is None:
+      return
+    try:
+      job.state, job.status = STOPPED, "Stopped"
+      if job.lines:
+        self._save_final(job)
+    finally:
+      self._job_ended(job)
 
   def _job_ended(self, job: Job) -> None:
-    self._running = None
-    self._refresh(job)
-    if self.pane.job is job:
-      self.pane.show_job(job)
-    self._update_clear_button()
-    self._start_next()
+    log.info(
+      "Job %s %s: %d lines -> %s%s", job.id, job.state, len(job.lines),
+      job.output_path or "(nothing saved)",
+      f" | {job.error.splitlines()[0]}" if job.error else "",
+    )
+    if self._running is job:
+      self._running = None
+    job.stop_token = None
+    try:
+      self._refresh(job)
+      if self.pane.job is job:
+        self.pane.show_job(job)
+      self._refresh_empty_state()
+    except Exception:  # noqa: BLE001 - a display glitch must never stall the queue
+      log.exception("Couldn't refresh the view after job %s", job.id)
+    finally:
+      QtCore.QTimer.singleShot(0, self._start_next)
 
-  # ---------- settings / lifecycle ----------
+  def _unsaved_jobs(self) -> list[Job]:
+    """Finished files whose text exists only in the app (saving failed)."""
+    return [
+      j for j in self.jobs.values()
+      if j.state in FINISHED_STATES and j.lines and not j.output_path
+    ]
+
+  def _queue_idle(self) -> None:
+    self._clash_choice = None
+    self._update_title()
+    if self._pending_update is not None and not self._unsaved_jobs():
+      self._install_update(*self._pending_update)
+
+  # ---------- settings / updates / lifecycle ----------
 
   def open_settings(self, tab: int) -> None:
     if self._settings_dialog is None:
       self._settings_dialog = SettingsDialog(
-        self, self.settings, self.pane.set_options, self.is_busy
+        self, self.settings, self.pane.set_options, self.is_busy, self.request_update_install,
       )
     self._settings_dialog.show_tab(tab)
 
-  def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-    if self.is_busy() and not QtWidgets.QApplication.instance().property("updating"):
-      answer = QtWidgets.QMessageBox.question(
-        self,
-        "Quit while transcribing?",
-        "A file is still being transcribed. If you quit now, only the part "
-        "transcribed so far is saved.",
-        QtWidgets.QMessageBox.StandardButton.Cancel | QtWidgets.QMessageBox.StandardButton.Yes,
-        QtWidgets.QMessageBox.StandardButton.Cancel,
+  def request_update_install(self, new_bundle: str, target: str) -> str:
+    """Install now ("now"), once the queue is done and saved ("later"), or "failed"."""
+    busy = self.is_busy() or any(j.state == QUEUED for j in self.jobs.values())
+    if busy or self._unsaved_jobs():
+      self._pending_update = (new_bundle, target)
+      log.info("Update downloaded; it installs once files are finished and saved")
+      return "later"
+    return "now" if self._install_update(new_bundle, target) else "failed"
+
+  def _install_update(self, new_bundle: str, target: str) -> bool:
+    import shutil
+
+    from uiwhispercpp import updater
+    self._pending_update = None
+    try:
+      updater.install_and_relaunch(new_bundle, target)
+    except OSError as error:
+      log.exception("Couldn't start the update installer")
+      shutil.rmtree(os.path.dirname(os.path.dirname(new_bundle)), ignore_errors=True)
+      QtWidgets.QMessageBox.warning(
+        self, "Update not installed",
+        f"The update couldn't be installed ({error.strerror or error}). Try again later.",
       )
-      if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+      return False
+    QtWidgets.QApplication.instance().setProperty("updating", True)
+    QtWidgets.QApplication.quit()
+    return True
+
+  def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+    updating = QtWidgets.QApplication.instance().property("updating")
+    unsaved = self._unsaved_jobs()
+    if unsaved and not self.is_busy() and not updating:
+      box = QtWidgets.QMessageBox(self)
+      box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+      box.setWindowTitle("Quit without saving?")
+      names = ", ".join(f"\u201c{j.name}\u201d" for j in unsaved[:3])
+      box.setText(f"The text of {names} couldn't be saved yet.")
+      box.setInformativeText(
+        "If you quit now, it is lost. Go back and use Save As… or Copy Text first."
+      )
+      back = box.addButton("Go Back", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+      quit_button = box.addButton(
+        "Quit Without Saving", QtWidgets.QMessageBox.ButtonRole.DestructiveRole
+      )
+      box.setDefaultButton(back)
+      box.exec()
+      if box.clickedButton() is not quit_button:
+        self.queue.select_job(unsaved[0].id)
         event.ignore()
         return
+    if self.is_busy() and not updating:
+      waiting = sum(1 for j in self.jobs.values() if j.state == QUEUED)
+      more = f" ({waiting} more waiting)" if waiting else ""
+      box = QtWidgets.QMessageBox(self)
+      box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+      box.setWindowTitle("Quit while transcribing?")
+      box.setText(f"“{self._running.name}” is still being transcribed{more}.")
+      box.setInformativeText(
+        "If you quit now, this file won't be finished and the waiting files won't "
+        "be transcribed. Text already saved stays on disk."
+      )
+      keep = box.addButton("Keep Transcribing", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+      quit_button = box.addButton("Quit Anyway", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+      box.setDefaultButton(keep)
+      box.exec()
+      if box.clickedButton() is not quit_button:
+        event.ignore()
+        return
+      if self._running is not None and self._running.stop_token is not None:
+        self._running.stop_token.stop()
     event.accept()
 
 
+def _sweep_leftovers() -> None:
+  # Runs in the background so startup stays instant.
+  from uiwhispercpp import updater
+  from uiwhispercpp.models.audio import sweep_temp_files
+  try:
+    sweep_temp_files()
+    updater.sweep_leftovers()
+  except Exception:  # noqa: BLE001 - housekeeping must never matter
+    log.exception("Cleaning up old temporary files failed")
+
+
 def run_program() -> None:
+  threading.Thread(target=_sweep_leftovers, name="cleanup", daemon=True).start()
   app = QtWidgets.QApplication(sys.argv)
   app.setApplicationName("UIWhisperCPP")
   app.setOrganizationName("Camphouse")
   apply_theme(app)
 
-  window = MainWindow()
+  try:
+    window = MainWindow()
+  except Exception:  # noqa: BLE001 - a corrupt preference must not brick the app
+    log.exception("Main window failed to start; resetting window settings")
+    Settings().reset_ui()
+    window = MainWindow()
   window.show()
 
   sys.exit(app.exec())

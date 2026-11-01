@@ -34,6 +34,10 @@ def main() -> None:
   import multiprocessing
   multiprocessing.freeze_support()
 
+  # Debug log (Help > Debug Log): file + in-memory, captures raw output too.
+  from uiwhispercpp import app_log
+  app_log.setup()
+
   # Before importing Qt: on a too-old macOS the bundled Qt can't even load,
   # so the user gets a clear native alert instead of a silent crash.
   exit_if_macos_outdated()

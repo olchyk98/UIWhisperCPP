@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 ACCENT = "#3b82f6"
 SUCCESS = "#22a355"
 DANGER = "#e5484d"
+WARNING = "#d08a00"
 
 
 def _rgba(color: QColor, alpha: float) -> str:
@@ -30,9 +31,41 @@ def build_stylesheet(palette: QPalette) -> str:
 QMainWindow, QWidget#Pane { background: %(window)s; }
 QWidget#Sidebar { background: %(sidebar)s; }
 QSplitter::handle { background: %(line)s; }
-QLabel#PaneTitle {
-  font-size: 11px; font-weight: 600; letter-spacing: 0.6px; color: %(muted)s;
+QLabel#PaneTitle { font-size: 12px; font-weight: 600; color: %(muted)s; }
+QLabel#WelcomeTitle { font-size: 20px; font-weight: 600; }
+QLabel#WelcomeText { font-size: 13px; color: %(muted)s; }
+QLabel#Hint { font-size: 12px; color: %(muted)s; }
+QPushButton#Primary {
+  background: %(accent)s; color: white; border: none; border-radius: 8px;
+  padding: 8px 18px; font-size: 14px; font-weight: 600;
 }
+QPushButton#Primary:hover { background: %(accent_hover)s; }
+QPushButton#Link { border: none; background: transparent; color: %(accent)s; padding: 2px; }
+QPushButton#Link:hover { text-decoration: underline; }
+QPushButton#Bordered {
+  border: 1px solid %(line_strong)s; border-radius: 6px; padding: 4px 11px;
+  background: transparent; color: %(text)s;
+}
+QPushButton#Bordered:hover { background: %(hover)s; }
+QPushButton#Bordered:disabled { color: %(muted)s; }
+QToolButton#Plus {
+  border: none; border-radius: 6px; font-size: 18px; padding: 0px 6px 2px 6px;
+  color: %(text)s;
+}
+QToolButton#Plus:hover { background: %(hover)s; }
+QToolButton#Plus::menu-indicator { image: none; }
+QFrame#Callout {
+  border-radius: 10px; border: 1px solid %(callout_border)s; background: %(callout_bg)s;
+}
+QFrame#Warning {
+  border-radius: 10px; border: 1px solid %(warning_border)s; background: %(warning_bg)s;
+}
+QLabel#CalloutTitle { font-weight: 600; }
+QLabel#Toast {
+  background: %(toast_bg)s; color: %(toast_text)s; border-radius: 10px;
+  padding: 10px 16px; font-size: 13px;
+}
+QLabel#CalloutText { color: %(muted)s; }
 QLabel#FileTitle { font-size: 16px; font-weight: 600; }
 QLabel#FileStatus { color: %(muted)s; }
 QListView#FileQueue { background: transparent; border: none; outline: none; }
@@ -47,6 +80,11 @@ QPushButton#Flat, QToolButton#Flat {
 }
 QPushButton#Flat:hover, QToolButton#Flat:hover { background: %(hover)s; }
 QPushButton#Flat:disabled { color: %(muted)s; }
+QPushButton#Quiet {
+  border: none; background: transparent; padding: 2px 4px;
+  font-size: 11px; color: %(faint)s;
+}
+QPushButton#Quiet:hover { color: %(muted)s; text-decoration: underline; }
 QPushButton#Add {
   border: 1px solid %(line_strong)s; border-radius: 7px; padding: 5px 10px;
   background: %(hover)s; color: %(text)s;
@@ -58,11 +96,20 @@ QPushButton#Add:pressed { background: %(line_strong)s; }
     "sidebar": sidebar.name(),
     "text": text.name(),
     "muted": _rgba(text, 0.5),
+    "faint": _rgba(text, 0.32),
     "line": _rgba(text, 0.10),
     "line_strong": _rgba(text, 0.16),
     "hover": _rgba(text, 0.06),
     "hover_strong": _rgba(text, 0.11),
     "accent_soft": _rgba(QColor(ACCENT), 0.35),
+    "accent": ACCENT,
+    "toast_bg": "rgba(40, 40, 40, 0.94)" if not dark else "rgba(235, 235, 235, 0.96)",
+    "toast_text": "#ffffff" if not dark else "#1a1a1a",
+    "accent_hover": QColor(ACCENT).darker(110).name(),
+    "callout_bg": _rgba(QColor(DANGER), 0.08),
+    "callout_border": _rgba(QColor(DANGER), 0.28),
+    "warning_bg": _rgba(QColor(WARNING), 0.09),
+    "warning_border": _rgba(QColor(WARNING), 0.30),
   }
 
 
@@ -119,7 +166,8 @@ def secondary_text(palette: QPalette) -> QColor:
 
 
 def selection_fill(selected: bool) -> QColor:
-  color = QColor(ACCENT)
-  color.setAlphaF(0.26 if selected else 0.09)
+  # Neutral, Finder-sidebar style: the accent is reserved for progress.
+  color = QColor(QApplication.palette().color(QPalette.ColorRole.WindowText))
+  color.setAlphaF(0.11 if selected else 0.05)
   return color
 

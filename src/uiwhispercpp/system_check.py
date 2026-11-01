@@ -18,10 +18,20 @@ def macos_version() -> tuple[int, ...] | None:
   if sys.platform != "darwin":
     return None
   raw = platform.mac_ver()[0]
+  if not raw or raw.startswith("10.16"):
+    # 10.16 is the compatibility version macOS reports to some programs
+    # (SYSTEM_VERSION_COMPAT); ask the kernel for the real one.
+    try:
+      raw = subprocess.run(
+        ["sysctl", "-n", "kern.osproductversion"], capture_output=True, text=True, timeout=5
+      ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+      raw = ""
   try:
-    return tuple(int(part) for part in raw.split(".") if part)
+    version = tuple(int(part) for part in raw.split(".") if part)
   except ValueError:
     return None
+  return version or None
 
 
 def is_apple_silicon() -> bool:

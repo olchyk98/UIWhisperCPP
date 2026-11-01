@@ -44,13 +44,23 @@ class ElidedLabel(QLabel):
 
 
 class CompactComboBox(QComboBox):
-  """Shows each item's short name when closed, the full description when open."""
+  """Shows each item's short name when closed, the full description when open.
+
+  `override_text`, when set, replaces the closed text entirely.
+  """
+
+  override_text: str = ""
+
+  def set_override_text(self, text: str) -> None:
+    self.override_text = text
+    self.updateGeometry()
+    self.update()
 
   def paintEvent(self, event) -> None:
     painter = QStylePainter(self)
     option = QStyleOptionComboBox()
     self.initStyleOption(option)
-    short = self.currentData(SHORT_TEXT_ROLE)
+    short = self.override_text or self.currentData(SHORT_TEXT_ROLE)
     if short:
       option.currentText = short
     painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
@@ -64,6 +74,8 @@ class CompactComboBox(QComboBox):
 
   def _hint(self, base: QSize) -> QSize:
     texts = [self.itemData(i, SHORT_TEXT_ROLE) or self.itemText(i) for i in range(self.count())]
+    if self.override_text:
+      texts.append(self.override_text)
     widest = max((self.fontMetrics().horizontalAdvance(t) for t in texts), default=0)
     option = QStyleOptionComboBox()
     self.initStyleOption(option)

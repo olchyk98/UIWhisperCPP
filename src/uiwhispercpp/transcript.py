@@ -97,33 +97,75 @@ def render_transcript(lines: list[Line], options: OutputOptions) -> str:
 
 
 def transcript_path_for(audio_path: str, options: OutputOptions) -> str:
-  """`talk.mp3` -> `talk.txt`; when a sibling like `talk.mp4` also exists, the
-  extension is kept (`talk.mp3.txt`) so the two transcripts don't overwrite
-  each other."""
+  """The default transcript path: `talk.mp3` -> `talk.txt`.
+
+  When another audio/video file with the same name sits in the folder
+  (`talk.mp4`, also differing only in letter case), the extension is kept
+  (`talk.mp3.txt`) so the two transcripts never land on the same file.
+  The result is never the audio file itself or another media file.
+  """
   from uiwhispercpp.audio_formats import is_audio_file
 
+  file_type = options.file_type if options.file_type in (FILE_TXT, FILE_SRT) else FILE_TXT
   stem, _extension = os.path.splitext(audio_path)
   folder, name = os.path.split(stem)
+  own = _normalized(os.path.basename(audio_path))
   try:
     siblings = [
       entry for entry in os.listdir(folder or ".")
-      if os.path.splitext(entry)[0] == name and is_audio_file(entry)
-      and os.path.join(folder, entry) != audio_path
+      if _normalized(os.path.splitext(entry)[0]) == _normalized(name)
+      and is_audio_file(entry) and _normalized(entry) != own
     ]
   except OSError:
     siblings = []
-  base = audio_path if siblings else stem
-  return base + "." + options.file_type
+  return (audio_path if siblings else stem) + "." + file_type
+
+
+def numbered_path(path: str, taken: set[str] | None = None) -> str:
+  """`talk.txt` -> the first free `talk (2).txt`, `talk (3).txt`, ...
+
+  `taken` holds paths already promised to other files, which also count as used.
+  """
+  stem, extension = os.path.splitext(path)
+  number = 2
+  while True:
+    candidate = f"{stem} ({number}){extension}"
+    if not os.path.exists(candidate) and candidate not in (taken or set()):
+      return candidate
+    number += 1
+
+
+def _normalized(name: str) -> str:
+  import unicodedata
+  return unicodedata.normalize("NFC", name).casefold()
+
+
+def write_transcript(path: str, lines: list[Line], options: OutputOptions) -> str:
+  """Write the transcript to exactly `path` and return it."""
+  text = render_transcript(lines, options)
+  # End text files with a newline, as POSIX tools expect (SRT already does).
+  if text and not text.endswith("\n"):
+    text += "\n"
+  # Write next to the target and swap it in, so a failed write (disk full)
+  # never leaves the existing file empty or half-written.
+  folder = os.path.dirname(path) or "."
+  temporary = os.path.join(folder, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+  try:
+    with open(temporary, "w", encoding="utf-8") as f:
+      f.write(text)
+    os.replace(temporary, path)
+  except BaseException:
+    try:
+      os.remove(temporary)
+    except OSError:
+      pass
+    raise
+  return path
 
 
 def save_transcript(audio_path: str, lines: list[Line], options: OutputOptions) -> str:
-  """Write the transcript next to the audio file and return its path."""
-  path = transcript_path_for(audio_path, options)
-  with open(path, "w", encoding="utf-8") as f:
-    text = render_transcript(lines, options)
-    # End text files with a newline, as POSIX tools expect (SRT already does).
-    f.write(text if not text or text.endswith("\n") else text + "\n")
-  return path
+  """Write the transcript next to the audio file (default name) and return its path."""
+  return write_transcript(transcript_path_for(audio_path, options), lines, options)
 
 
 SAMPLE_LINES = [

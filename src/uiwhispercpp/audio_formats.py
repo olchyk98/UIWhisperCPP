@@ -24,20 +24,26 @@ def file_dialog_filter() -> str:
   return f"Audio & video files ({patterns});;All files (*)"
 
 
-def expand_paths(paths: list[str]) -> list[str]:
+def expand_paths(paths: list[str]) -> tuple[list[str], list[str]]:
   """Turn dropped/selected files and folders into a sorted list of audio files.
 
   Folders contribute the audio files directly inside them (not sub-folders),
-  matching the "Add folder" button.
+  matching the "Add folder" button. Returns (audio files, folders that could
+  not be opened).
   """
   found: list[str] = []
+  unreadable: list[str] = []
   for path in paths:
     if os.path.isdir(path):
-      entries = sorted(os.listdir(path), key=str.lower)
+      try:
+        entries = sorted(os.listdir(path), key=str.lower)
+      except OSError:
+        unreadable.append(path)
+        continue
       found += [
         os.path.join(path, name) for name in entries
         if os.path.isfile(os.path.join(path, name)) and is_audio_file(name)
       ]
     elif os.path.isfile(path) and is_audio_file(path):
       found.append(path)
-  return found
+  return found, unreadable

@@ -22,12 +22,24 @@ responsive. See `Diarizer`.
 import multiprocessing
 import os
 import queue as _queue
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import time
+
+from uiwhispercpp import app_log
 from uiwhispercpp.models.audio import decode_to_mono_wav
-from uiwhispercpp.models.base import Segment
+from uiwhispercpp.models.base import Segment, StopToken, UserFacingError
+from uiwhispercpp.models.downloads import download, format_size
+
+_log = app_log.get("diarization")
+# If the separation process reports no progress for this long, it is treated
+# as hung and stopped (progress normally arrives every few seconds).
+_WATCHDOG_SECONDS = 10 * 60
+
+
+class DiarizationError(UserFacingError):
+  """Speaker separation failed; the message is short and user-facing."""
 
 # Public, non-gated ONNX weights (no HuggingFace account/token needed):
 # pyannote segmentation-3.0 and the WeSpeaker ResNet34 embedding, both as the
@@ -91,6 +103,7 @@ class Diarizer:
     num_speakers: int = AUTO_SPEAKERS,
     on_progress: OnProgress | None = None,
     on_log: OnLog | None = None,
+    stop: StopToken | None = None,
   ) -> list[SpeakerSegment]:
     """Return speaker-labelled spans for `audio_path`, sorted by start time.
 
@@ -101,7 +114,7 @@ class Diarizer:
     are logged) on first use; diarization runs in a child process.
     """
     log = on_log or (lambda _message: None)
-    segmentation_model, embedding_model = _ensure_models(log)
+    segmentation_model, embedding_model = _ensure_models(log, stop)
 
     # spawn, never fork: the parent already has Qt (and possibly Metal/MLX)
     # initialised, and forking that state on macOS crashes.
@@ -113,17 +126,22 @@ class Diarizer:
       daemon=True,
     )
     process.start()
+    last_activity = time.monotonic()
     try:
       while True:
+        if stop is not None:
+          stop.check()
         try:
           # Blocking get with the GIL released -> the GUI thread runs freely.
           kind, payload = results.get(timeout=1.0)
         except _queue.Empty:
           if not process.is_alive():
-            raise RuntimeError(
-              "Speaker diarization process exited without returning a result."
-            )
+            _log.error("Separation process exited with code %s", process.exitcode)
+            raise DiarizationError("the separation step stopped unexpectedly")
+          if time.monotonic() - last_activity > _WATCHDOG_SECONDS:
+            raise DiarizationError("the separation step stopped responding")
           continue
+        last_activity = time.monotonic()
         if kind == "progress":
           if on_progress is not None:
             on_progress(payload)
@@ -132,7 +150,11 @@ class Diarizer:
             SpeakerSegment(start, end, speaker) for start, end, speaker in payload
           ]
         elif kind == "error":
-          raise RuntimeError(f"Speaker diarization failed:\n{payload}")
+          _log.error("Separation failed in the child process:\n%s", payload)
+          if "onnxruntime" in payload.lower() or "INVALID_PROTOBUF" in payload:
+            # A damaged cached model would fail the same way forever.
+            _forget_models()
+          raise DiarizationError("the separation step hit an error (see Help > Debug Log)")
     finally:
       if process.is_alive():
         process.terminate()
@@ -266,27 +288,37 @@ def _models_dir() -> str:
   return directory
 
 
-def _ensure_models(log: OnLog) -> tuple[str, str]:
+def _ensure_models(log: OnLog, stop: StopToken | None = None) -> tuple[str, str]:
   """Download the segmentation + embedding ONNX models on first use; return paths."""
   directory = _models_dir()
   segmentation_path = os.path.join(directory, _SEGMENTATION_MODEL)
   embedding_path = os.path.join(directory, _EMBEDDING_MODEL)
 
-  if not os.path.exists(segmentation_path):
-    _download(_SEGMENTATION_URL, segmentation_path, "speaker segmentation model", log)
-  if not os.path.exists(embedding_path):
-    _download(_EMBEDDING_URL, embedding_path, "speaker embedding model", log)
+  for url, path in ((_SEGMENTATION_URL, segmentation_path), (_EMBEDDING_URL, embedding_path)):
+    if os.path.exists(path):
+      continue
+
+    def on_bytes(done: int, total: int) -> None:
+      if not done and not total:
+        return  # still connecting; the generic status covers it
+      if total:
+        log(f"Downloading speaker files ({format_size(done)} of {format_size(total)}, "
+            f"one-time) {done * 100 // total}%")
+      else:
+        log(f"Downloading speaker files ({format_size(done)}, one-time)...")
+
+    download(url, path, what="speaker files", on_bytes=on_bytes, stop=stop, min_size=1_000_000)
 
   return segmentation_path, embedding_path
 
 
-def _download(url: str, destination: str, label: str, log: OnLog) -> None:
-  """Download `url` to `destination` atomically (download once, then rename)."""
-  log(f"Downloading {label} (one-time, ~once per machine)...")
-  partial = destination + ".part"
-  urllib.request.urlretrieve(url, partial)
-  os.replace(partial, destination)
-  log(f"Downloaded {label}.")
+def _forget_models() -> None:
+  """Delete the cached ONNX models so the next run downloads them fresh."""
+  for name in (_SEGMENTATION_MODEL, _EMBEDDING_MODEL):
+    try:
+      os.remove(os.path.join(_models_dir(), name))
+    except OSError:
+      pass
 
 
 def _load_mono_resampled(audio_path: str, target_rate: int):
@@ -300,9 +332,7 @@ def _load_mono_resampled(audio_path: str, target_rate: int):
   try:
     import soundfile
   except ImportError as error:
-    raise RuntimeError(
-      "soundfile is not installed. Install it with `uv add soundfile`."
-    ) from error
+    raise RuntimeError("A component for reading audio (soundfile) is missing.") from error
   wav_path = decode_to_mono_wav(audio_path)
   try:
     samples, sample_rate = soundfile.read(wav_path, dtype="float32", always_2d=False)

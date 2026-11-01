@@ -53,6 +53,37 @@ class ModelOption:
   short_label: str = ""
 
 
+class UserFacingError(RuntimeError):
+  """An error whose message is written for the user and shown as-is.
+
+  Anything else that goes wrong in a job is shown as a generic message, with
+  the real exception (and traceback) only in the debug log.
+  """
+
+
+class JobStopped(Exception):
+  """Raised inside a job when the user pressed Stop."""
+
+
+class StopToken:
+  """Shared flag a running job polls so the user can stop it.
+
+  Engines call `check()` at safe points (between audio windows, in progress or
+  segment callbacks, between download chunks); it raises `JobStopped` once
+  `stop()` was called from the UI.
+  """
+
+  def __init__(self) -> None:
+    self.stopped = False
+
+  def stop(self) -> None:
+    self.stopped = True
+
+  def check(self) -> None:
+    if self.stopped:
+      raise JobStopped()
+
+
 # Called once per segment, as transcription produces it.
 OnSegment = Callable[[Segment], None]
 # Called with a completion percentage in the range 0..100.
@@ -83,6 +114,7 @@ class Model(ABC):
     on_segment: OnSegment,
     on_progress: OnProgress,
     on_status: OnStatus | None = None,
+    stop: StopToken | None = None,
   ) -> list[Segment]:
     """Transcribe `audio_path` using the variant identified by `model_key`.
 

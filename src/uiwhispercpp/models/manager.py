@@ -6,6 +6,8 @@ from uiwhispercpp.models.base import (
   OnSegment,
   OnStatus,
   Segment,
+  StopToken,
+  UserFacingError,
 )
 from uiwhispercpp.models.audio import check_audio
 from uiwhispercpp.models.parakeet import Parakeet
@@ -49,6 +51,7 @@ class ModelManager:
     on_segment: OnSegment,
     on_progress: OnProgress,
     on_status: OnStatus | None = None,
+    stop: StopToken | None = None,
   ) -> list[Segment]:
     """Transcribe `audio_path` with the model identified by `model_key`."""
     backend = self._backend_by_key.get(model_key)
@@ -56,7 +59,7 @@ class ModelManager:
       raise ValueError(f"Unknown model '{model_key}'.")
     option = next(o for o in backend.options if o.key == model_key)
     if option.unavailable_reason:
-      raise RuntimeError(option.unavailable_reason)
+      raise UserFacingError(option.unavailable_reason)
     check_audio(audio_path)
 
     # Keep a single model in memory: release the previous backend's weights
@@ -72,4 +75,5 @@ class ModelManager:
       on_segment=on_segment,
       on_progress=on_progress,
       on_status=on_status,
+      stop=stop,
     )

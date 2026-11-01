@@ -16,7 +16,9 @@ Testing hooks (environment variables):
 """
 from collections.abc import Callable
 from dataclasses import dataclass
+import hashlib
 import json
+import plistlib
 import os
 import re
 import shutil
@@ -45,6 +47,8 @@ class Release:
   name: str
   asset_url: str
   asset_size: int
+  # "sha256:<hex>" as published by GitHub for the asset ("" if absent).
+  asset_digest: str = ""
 
 
 def current_version() -> str:
@@ -89,7 +93,9 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def _open(url: str, accept: str) -> object:
+def _open(
+  url: str, accept: str, not_found: str = "No releases found for that repository."
+) -> object:
   request = urllib.request.Request(
     url, headers={"Accept": accept, "User-Agent": f"UIWhisperCPP/{__version__}"}
   )
@@ -97,39 +103,79 @@ def _open(url: str, accept: str) -> object:
     return urllib.request.urlopen(request, timeout=_TIMEOUT, context=_ssl_context())
   except urllib.error.HTTPError as error:
     if error.code == 404:
-      raise UpdateError("No releases found for that repository.") from error
-    if error.code == 403:
-      raise UpdateError("GitHub is rate-limiting requests. Try again later.") from error
-    raise UpdateError(f"GitHub returned an error ({error.code}).") from error
+      raise UpdateError(not_found) from error
+    if error.code in (403, 429) and (
+      error.code == 429 or error.headers.get("X-RateLimit-Remaining") == "0"
+    ):
+      raise UpdateError("Too many update checks in a short time. Try again in an hour.") from error
+    raise UpdateError(
+      f"Couldn't check for updates right now (error {error.code}). Try again later."
+    ) from error
   except (urllib.error.URLError, TimeoutError, OSError) as error:
     raise UpdateError("Couldn't reach GitHub. Check your internet connection.") from error
 
 
 def fetch_latest_release(repo: str) -> Release:
   owner_repo = parse_repo(repo)
-  with _open(f"{_api_base()}/repos/{owner_repo}/releases/latest",
-             "application/vnd.github+json") as response:
-    data = json.load(response)
-  assets = [a for a in data.get("assets", []) if a.get("name", "").endswith(_ASSET_SUFFIX)]
+  try:
+    with _open(f"{_api_base()}/repos/{owner_repo}/releases/latest",
+               "application/vnd.github+json") as response:
+      data = json.load(response)
+    if not isinstance(data, dict):
+      raise ValueError("not an object")
+  except (ValueError, OSError) as error:
+    raise UpdateError(
+      "Got an unexpected answer from GitHub. If you're on public Wi-Fi, log in first, "
+      "then try again."
+    ) from error
+  raw_assets = data.get("assets")
+  assets = [
+    a for a in (raw_assets if isinstance(raw_assets, list) else [])
+    if isinstance(a, dict) and str(a.get("name", "")).endswith(_ASSET_SUFFIX)
+    and isinstance(a.get("browser_download_url"), str)
+  ]
+  tag = data.get("tag_name")
+  if not isinstance(tag, str) or not tag.strip():
+    raise UpdateError("Got an unexpected answer from GitHub. Try again later.")
   if not assets:
     raise UpdateError(
-      f"The latest release ({data.get('tag_name', '?')}) has no app download attached."
+      f"Version {tag} isn't ready to download yet. Try again later."
     )
   asset = next((a for a in assets if a["name"] == "UIWhisperCPP.app.zip"), assets[0])
-  tag = data.get("tag_name", "")
   return Release(
     version=".".join(str(n) for n in version_tuple(tag)),
     tag=tag,
-    name=data.get("name") or tag,
+    name=data.get("name") if isinstance(data.get("name"), str) and data.get("name") else tag,
     asset_url=asset["browser_download_url"],
-    asset_size=int(asset.get("size") or 0),
+    asset_size=_safe_int(asset.get("size")),
+    asset_digest=asset.get("digest") if isinstance(asset.get("digest"), str) else "",
   )
+
+
+def _safe_int(value: object) -> int:
+  try:
+    return max(0, int(value))
+  except (TypeError, ValueError, OverflowError):
+    return 0
 
 
 def check_for_update(repo: str) -> Release | None:
   """The latest release when it is newer than this app, else None."""
   release = fetch_latest_release(repo)
   return release if is_newer(release.version, current_version()) else None
+
+
+def sweep_leftovers(max_age_hours: float = 1) -> None:
+  """Remove update work folders left by interrupted or failed updates."""
+  import glob
+  import time
+  cutoff = time.time() - max_age_hours * 3600
+  for path in glob.glob(os.path.join(tempfile.gettempdir(), "uiwhispercpp-update-*")):
+    try:
+      if os.path.getmtime(path) < cutoff:
+        shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+      pass
 
 
 def running_app_bundle() -> str | None:
@@ -152,7 +198,7 @@ def can_self_update() -> tuple[bool, str]:
   if not os.access(os.path.dirname(bundle), os.W_OK):
     return False, (
       f"No permission to replace the app in {os.path.dirname(bundle)}. "
-      "Move it to Applications or your user folder and try again."
+      "Drag UIWhisperCPP into Applications, open it from there and try again."
     )
   return True, ""
 
@@ -164,18 +210,49 @@ def download_update(
 ) -> str:
   """Download and unpack the release; return the path of the new .app bundle."""
   work_dir = tempfile.mkdtemp(prefix="uiwhispercpp-update-")
+  try:
+    return _download_into(release, work_dir, on_progress, is_cancelled)
+  except BaseException:
+    shutil.rmtree(work_dir, ignore_errors=True)
+    raise
+
+
+def _download_into(
+  release: Release,
+  work_dir: str,
+  on_progress: Callable[[int, int], None],
+  is_cancelled: Callable[[], bool],
+) -> str:
   zip_path = os.path.join(work_dir, "update.zip")
-  with _open(release.asset_url, "application/octet-stream") as response:
-    total = int(response.headers.get("Content-Length") or release.asset_size or 0)
+  sha256 = hashlib.sha256()
+  with _open(
+    release.asset_url, "application/octet-stream",
+    not_found="The update file is no longer available. Try again later.",
+  ) as response:
+    _close_on_cancel(response, is_cancelled)
+    total = _safe_int(response.headers.get("Content-Length")) or release.asset_size
     done = 0
     with open(zip_path, "wb") as out:
-      while chunk := response.read(_CHUNK):
+      while True:
+        try:
+          chunk = response.read(_CHUNK)
+        except (OSError, TimeoutError, ValueError) as error:
+          if is_cancelled():
+            raise UpdateError("Update cancelled.") from error
+          raise UpdateError("The download was interrupted. Try again.") from error
+        if not chunk:
+          break
         if is_cancelled():
-          shutil.rmtree(work_dir, ignore_errors=True)
           raise UpdateError("Update cancelled.")
         out.write(chunk)
+        sha256.update(chunk)
         done += len(chunk)
         on_progress(done, total)
+  if total and done != total:
+    raise UpdateError("The download was interrupted. Try again.")
+  if release.asset_digest.startswith("sha256:"):
+    if sha256.hexdigest() != release.asset_digest.split(":", 1)[1].lower():
+      raise UpdateError("The downloaded update is damaged. Try again.")
   extract_dir = os.path.join(work_dir, "extracted")
   result = subprocess.run(
     ["ditto", "-x", "-k", zip_path, extract_dir], capture_output=True, text=True
@@ -187,9 +264,60 @@ def download_update(
   if not bundles:
     raise UpdateError("The downloaded update doesn't contain the app.")
   new_bundle = os.path.join(extract_dir, bundles[0])
-  if not os.path.isfile(os.path.join(new_bundle, "Contents", "Info.plist")):
-    raise UpdateError("The downloaded update doesn't contain a valid app.")
+  _verify_bundle(new_bundle)
   return new_bundle
+
+
+def _close_on_cancel(response: object, is_cancelled: Callable[[], bool]) -> None:
+  """Close the connection once cancelled, so a stalled read ends right away."""
+  import threading
+
+  def watch() -> None:
+    while not getattr(response, "closed", False):
+      if is_cancelled():
+        try:
+          response.close()
+        except Exception:  # noqa: BLE001
+          pass
+        return
+      threading.Event().wait(0.3)
+
+  threading.Thread(target=watch, name="update-cancel", daemon=True).start()
+
+
+def _verify_bundle(bundle: str) -> None:
+  """Refuse a bundle that isn't this app or whose code signature is broken.
+
+  Releases are ad-hoc signed (no Apple Team ID), so this proves integrity
+  and identity of the bundle rather than who built it; authenticity rests on
+  the HTTPS download from the configured GitHub repository plus the asset's
+  published SHA-256 digest.
+  """
+  plist_path = os.path.join(bundle, "Contents", "Info.plist")
+  try:
+    with open(plist_path, "rb") as f:
+      info = plistlib.load(f)
+  except (OSError, plistlib.InvalidFileException) as error:
+    raise UpdateError("The downloaded update doesn't contain a valid app.") from error
+  expected_id = _running_bundle_id()
+  if expected_id and info.get("CFBundleIdentifier") != expected_id:
+    raise UpdateError("The downloaded update isn't UIWhisperCPP. It was not installed.")
+  result = subprocess.run(
+    ["codesign", "--verify", "--deep", "--strict", bundle], capture_output=True, text=True
+  )
+  if result.returncode != 0:
+    raise UpdateError("The downloaded update failed its integrity check. It was not installed.")
+
+
+def _running_bundle_id() -> str | None:
+  bundle = running_app_bundle()
+  if bundle is None:
+    return None
+  try:
+    with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as f:
+      return plistlib.load(f).get("CFBundleIdentifier")
+  except (OSError, plistlib.InvalidFileException):
+    return None
 
 
 _INSTALL_SCRIPT = r"""#!/bin/sh
@@ -198,7 +326,6 @@ PID="$1"; NEW="$2"; TARGET="$3"; BACKUP="$TARGET.update-backup"
 while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done
 rm -rf "$BACKUP"
 if mv "$TARGET" "$BACKUP" && mv "$NEW" "$TARGET"; then
-  xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null
   rm -rf "$BACKUP"
 else
   [ -d "$BACKUP" ] && [ ! -d "$TARGET" ] && mv "$BACKUP" "$TARGET"

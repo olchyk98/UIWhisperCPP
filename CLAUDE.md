@@ -12,3 +12,8 @@
   `UIWHISPERCPP_GITHUB_API=<url>` points the release lookup at another API base.
 - Testing without touching real preferences: `UIWHISPERCPP_SETTINGS_FILE=/tmp/x.ini uv run app`
   stores all settings in that INI file instead of the user's defaults.
+- Debug log: `~/Library/Logs/UIWhisperCPP/app.log` (also Help > Debug Log in the app). It captures
+  Python logging plus raw stdout/stderr of the process and its children; check it first when
+  something misbehaves.
+- Errors shown to users must be `UserFacingError` (models/base.py) with plain wording; anything
+  else is shown as a generic message and logged with its traceback.

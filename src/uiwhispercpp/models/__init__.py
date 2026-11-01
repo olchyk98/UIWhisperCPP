@@ -4,7 +4,15 @@
 interface new backends implement; `Segment` and `ModelOption` are the shared
 data types they exchange.
 """
-from uiwhispercpp.models.base import Model, ModelOption, Segment, Word
+from uiwhispercpp.models.base import (
+  JobStopped,
+  Model,
+  ModelOption,
+  Segment,
+  StopToken,
+  UserFacingError,
+  Word,
+)
 from uiwhispercpp.models.diarization import (
   Diarizer,
   SpeakerSegment,
@@ -15,6 +23,9 @@ from uiwhispercpp.models.manager import ModelManager
 
 __all__ = [
   "Diarizer",
+  "JobStopped",
+  "StopToken",
+  "UserFacingError",
   "Model",
   "ModelManager",
   "ModelOption",

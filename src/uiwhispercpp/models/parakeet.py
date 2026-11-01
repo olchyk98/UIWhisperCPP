@@ -1,6 +1,7 @@
 """Parakeet backend, powered by parakeet-mlx (Apple Silicon / MLX)."""
 from collections.abc import Callable
 import importlib
+import os
 import importlib.util
 import shutil
 import subprocess
@@ -14,9 +15,15 @@ from uiwhispercpp.models.base import (
   OnSegment,
   OnStatus,
   Segment,
+  StopToken,
+  UserFacingError,
   Word,
 )
+from uiwhispercpp.models.downloads import download, format_size
+from uiwhispercpp import app_log
 from uiwhispercpp.system_check import is_apple_silicon
+
+_log = app_log.get("parakeet")
 
 # Kept in sync with pyproject.toml; used when a source checkout lacks the
 # package and we install it on first use.
@@ -45,7 +52,7 @@ class Parakeet(Model):
   """
 
   _KEY = "mlx-community/parakeet-tdt-0.6b-v3"
-  _LABEL = "Parakeet v3 - Fast multilingual, Apple Silicon (600MB)"
+  _LABEL = "Parakeet v3 - fast and accurate, recommended (2.5 GB)"
 
   def __init__(self) -> None:
     # Typed as object because parakeet_mlx is imported lazily in _load.
@@ -67,10 +74,11 @@ class Parakeet(Model):
     on_segment: OnSegment,
     on_progress: OnProgress,
     on_status: OnStatus | None = None,
+    stop: StopToken | None = None,
   ) -> list[Segment]:
     status = on_status or (lambda _message: None)
     ensure_ffmpeg_on_path()
-    model = self._load(model_key, status)
+    model = self._load(model_key, status, stop)
     status("Transcribing...")
 
     from parakeet_mlx.parakeet import Beam, DecodingConfig
@@ -93,6 +101,7 @@ class Parakeet(Model):
       decoding_config=DecodingConfig(decoding=Beam(beam_size=BEAM_SIZE)),
       on_progress=on_progress,
       on_sentence=lambda sentence: on_segment(to_segment(sentence)),
+      stop=stop,
     )
     return [to_segment(sentence) for sentence in result.sentences]
 
@@ -100,7 +109,7 @@ class Parakeet(Model):
     self._model = None
     self._loaded_key = None
 
-  def _load(self, model_key: str, status: OnStatus) -> object:
+  def _load(self, model_key: str, status: OnStatus, stop: StopToken | None) -> object:
     if self._model is not None and self._loaded_key == model_key:
       return self._model
     self.unload()
@@ -109,13 +118,14 @@ class Parakeet(Model):
     try:
       from parakeet_mlx import from_pretrained
     except (ImportError, OSError) as error:
-      raise RuntimeError(
-        "Parakeet couldn't start on this Mac. Pick a Whisper model in the "
-        f"model list instead. (Details: {error})"
+      raise UserFacingError(
+        "Parakeet couldn't start on this Mac. Choose a Whisper model in the "
+        "menu at the bottom of the window, then try again."
       ) from error
     _apply_power_spectrum_fix()
-    status("Loading Parakeet (downloads 600 MB the first time)...")
-    self._model = from_pretrained(model_key)
+    model_dir = _ensure_model_files(model_key, status, stop)
+    status("Loading the model...")
+    self._model = from_pretrained(model_dir)
     self._loaded_key = model_key
     return self._model
 
@@ -127,6 +137,7 @@ def _transcribe_streaming(
   decoding_config: object,
   on_progress: OnProgress,
   on_sentence: "Callable[[object], None]",
+  stop: StopToken | None = None,
 ) -> object:
   """parakeet-mlx's chunked `transcribe`, emitting sentences as they settle.
 
@@ -162,6 +173,8 @@ def _transcribe_streaming(
   tokens: list = []
   step = chunk - overlap
   for start in range(0, total, step):
+    if stop is not None:
+      stop.check()
     end = min(start + chunk, total)
     on_progress(int(start / total * 100))
     if end - start < config.hop_length:
@@ -194,6 +207,53 @@ def _transcribe_streaming(
   return result
 
 
+_MODEL_FILES = ("config.json", "model.safetensors")
+
+
+def _ensure_model_files(model_key: str, status: OnStatus, stop: StopToken | None) -> str:
+  """Return a local folder holding the model, downloading it safely if needed.
+
+  A copy already in the Hugging Face cache (from earlier versions of the app)
+  is reused. Otherwise both files are fetched into the app's own model folder
+  with progress, timeouts and atomic renames, so an interrupted download is
+  never mistaken for a complete one.
+  """
+  try:
+    from huggingface_hub import try_to_load_from_cache
+    cached = [try_to_load_from_cache(model_key, name) for name in _MODEL_FILES]
+    if all(isinstance(path, str) and os.path.exists(path) for path in cached):
+      return os.path.dirname(cached[0])
+  except Exception:  # noqa: BLE001 - the cache is only an optimisation
+    pass
+  folder = os.path.expanduser(
+    f"~/Library/Application Support/UIWhisperCPP/models/{model_key.replace('/', '--')}"
+  )
+  for name in _MODEL_FILES:
+    path = os.path.join(folder, name)
+    if os.path.exists(path):
+      continue
+
+    def on_bytes(done: int, total: int, name: str = name) -> None:
+      if name == "config.json":
+        return
+      if not done and not total:
+        return  # still connecting; the generic status covers it
+      if total:
+        status(
+          f"Downloading Parakeet v3 ({format_size(done)} of {format_size(total)}, "
+          f"one-time) {done * 100 // total}%"
+        )
+      else:
+        status(f"Downloading Parakeet v3 ({format_size(done)}, one-time)...")
+
+    download(
+      f"https://huggingface.co/{model_key}/resolve/main/{name}", path,
+      what="Parakeet v3 model", on_bytes=on_bytes, stop=stop,
+      min_size=100 if name == "config.json" else 100_000_000,
+    )
+  return folder
+
+
 def _is_frozen() -> bool:
   return bool(getattr(sys, "frozen", False))
 
@@ -205,7 +265,7 @@ def parakeet_unavailable_reason() -> str | None:
   package is installed automatically on first use (see `_install_parakeet`).
   """
   if not is_apple_silicon():
-    return "Parakeet needs an Apple Silicon Mac (M1 or newer)."
+    return "Parakeet needs a Mac with Apple Silicon (M1 or newer)."
   if _is_frozen() and importlib.util.find_spec("parakeet_mlx") is None:
     return "Parakeet isn't included in this build of the app."
   return None
@@ -217,7 +277,7 @@ def _install_parakeet(status: OnStatus) -> None:
   uv-managed virtualenvs ship without pip, so prefer `uv pip install` aimed at
   this interpreter, and fall back to bootstrapping pip via ensurepip.
   """
-  status("Installing Parakeet (one-time, ~1 min)...")
+  status("Setting up Parakeet (one-time, about a minute)...")
   uv = shutil.which("uv")
   if uv:
     commands = [[uv, "pip", "install", "--python", sys.executable, PARAKEET_REQUIREMENT]]
@@ -227,14 +287,17 @@ def _install_parakeet(status: OnStatus) -> None:
       [sys.executable, "-m", "pip", "install", PARAKEET_REQUIREMENT],
     ]
   for command in commands:
+    _log.info("Installing Parakeet: %s", " ".join(command))
     result = subprocess.run(command, capture_output=True, text=True)
+    for line in (result.stdout + result.stderr).splitlines():
+      _log.info("  %s", line)
     if result.returncode != 0:
       tail = (result.stderr or result.stdout).strip().splitlines()[-3:]
       # Tools indent wrapped lines; collapse all runs of whitespace.
-      details = " ".join(" ".join(tail).split())
-      raise RuntimeError(
-        "Couldn't install Parakeet automatically. Check your internet "
-        f"connection, or pick a Whisper model. (Details: {details})"
+      _log.warning("Parakeet install failed: %s", " ".join(" ".join(tail).split()))
+      raise UserFacingError(
+        "Couldn't set up Parakeet. Check your internet connection and try "
+        "again, or choose a Whisper model at the bottom of the window."
       )
   importlib.invalidate_caches()
 
