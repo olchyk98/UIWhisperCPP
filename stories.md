@@ -214,8 +214,8 @@ everything, including the engines' raw output.
 - **When** the user opens the language menu
 - **Then** they can pick "Auto-detect language" (default), English, Ukrainian, Swedish, Russian,
   German, French, Spanish, Italian, Polish, Dutch or Portuguese
-- **And** while Parakeet is selected the language menu is hidden, since Parakeet recognises the
-  language by itself
+- **And** while Parakeet is selected the language menu stays visible but greyed out, since
+  Parakeet recognises the language by itself; the chosen language applies again with Whisper
 
 **Scenario: Parakeet on a Mac that can't run it**
 - **Given** the Mac has an Intel processor

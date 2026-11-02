@@ -115,11 +115,13 @@ class BottomBar(QtWidgets.QWidget):
     show_people = self.diarize.isChecked()
     self.people_label.setVisible(show_people)
     self.speakers.setVisible(show_people)
-    # Parakeet detects the language itself, so the menu would be ignored.
-    # (hidden rather than greyed out: one less control nobody can use)
+    # Parakeet detects the language itself and takes no hint, so the menu stays
+    # in place but is greyed out (the saved choice is kept for Whisper).
     automatic = self.model_key().startswith(_PARAKEET_PREFIX)
-    self.language.setVisible(not automatic)
+    self.language.setEnabled(not automatic)
     self.language.setToolTip(
+      "Parakeet recognises the language by itself. Choose a Whisper model to set it."
+      if automatic else
       "The language spoken in the recording. Leave on Auto-detect if unsure."
     )
 
