@@ -7,6 +7,8 @@ Settings - goes through `render_transcript`, so they always match.
 """
 from dataclasses import dataclass
 import os
+import stat
+import tempfile
 
 from uiwhispercpp.models import Segment, Turn
 
@@ -148,11 +150,16 @@ def write_transcript(path: str, lines: list[Line], options: OutputOptions) -> st
     text += "\n"
   # Write next to the target and swap it in, so a failed write (disk full)
   # never leaves the existing file empty or half-written.
+  # mkstemp picks an unpredictable name and refuses to follow a planted
+  # symlink, so the write can't be redirected onto another file.
   folder = os.path.dirname(path) or "."
-  temporary = os.path.join(folder, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+  fd, temporary = tempfile.mkstemp(dir=folder, prefix=f".{os.path.basename(path)}.",
+                                   suffix=".tmp")
   try:
-    with open(temporary, "w", encoding="utf-8") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
       f.write(text)
+    # mkstemp creates the file owner-only; keep the usual readable mode.
+    os.chmod(temporary, _mode_for(path))
     os.replace(temporary, path)
   except BaseException:
     try:
@@ -161,6 +168,14 @@ def write_transcript(path: str, lines: list[Line], options: OutputOptions) -> st
       pass
     raise
   return path
+
+
+def _mode_for(path: str) -> int:
+  """Keep an existing file's permissions; new files get rw-r--r--."""
+  try:
+    return stat.S_IMODE(os.stat(path).st_mode)
+  except OSError:
+    return 0o644
 
 
 def save_transcript(audio_path: str, lines: list[Line], options: OutputOptions) -> str:
