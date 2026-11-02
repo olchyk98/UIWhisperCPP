@@ -5,7 +5,7 @@ LSMinimumSystemVersion), the updater compares `__version__` against GitHub
 release tags, and the startup check warns on Macs older than `MIN_MACOS`.
 """
 
-__version__ = "1.5"
+__version__ = "2.0"
 
 # The bundled Qt bindings (PySide6/shiboken6) and MLX are built for macOS 15,
 # so the packaged app cannot run on anything older. Raise this when a bundled
